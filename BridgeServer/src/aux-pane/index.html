@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LevityBridge</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="aurora"></div>
+  <main class="panel">
+    <header class="hero">
+      <div class="badge-row">
+        <span class="dot" id="status-dot"></span>
+        <span id="status-label">正在连接守护服务…</span>
+      </div>
+      <h1>LevityBridge</h1>
+      <p class="subtitle">Levity Companion · Live Desktop Session Bridge</p>
+    </header>
+
+    <section class="glass-card qr-section">
+      <div class="qr-box" id="qr-container"></div>
+      <p class="qr-hint">Scan with iPhone Camera or Levity / 用手机或 Levity 扫码配对</p>
+      <div class="btn-row">
+        <button id="copy-uri-btn" class="btn primary">复制配对链接</button>
+        <button id="rotate-btn" class="btn ghost">重置令牌</button>
+      </div>
+      <div id="toast" class="toast hidden">已复制到剪贴板</div>
+    </section>
+
+    <section class="glass-card info-section">
+      <div class="kv">
+        <span class="k">Tailscale 直连</span>
+        <code class="v" id="ts-addr">—</code>
+      </div>
+      <div class="kv">
+        <span class="k">局域网地址</span>
+        <code class="v" id="lan-addr">—</code>
+      </div>
+      <div class="kv">
+        <span class="k">在线移动端</span>
+        <strong class="v accent" id="clients-count">0 台</strong>
+      </div>
+      <div class="kv">
+        <span class="k">官方引擎</span>
+        <span class="v" id="engine-status">检测中…</span>
+      </div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

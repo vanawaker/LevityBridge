@@ -1,0 +1,937 @@
+import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { test } from 'node:test';
+import { AgentController } from '../src/agent-controller.mjs';
+import { ApnsPusher } from '../src/apns-pusher.mjs';
+import { BrainScanner } from '../src/brain-scanner.mjs';
+import { BridgeServer } from '../src/bridge-server.mjs';
+import { MetaStore } from '../src/meta-store.mjs';
+import { generateQrSvg } from '../src/qr-svg.mjs';
+import { QuotaMonitor } from '../src/quota-monitor.mjs';
+
+test('QuotaMonitor parses GetUserStatus model quota pools and reset times', () => {
+  const parsed = QuotaMonitor.parseUserStatus({
+    userTier: { name: 'Google AI Ultra' },
+    cascadeModelConfigData: {
+      clientModelConfigs: [
+        {
+          label: 'Gemini 4 Carbon (High)',
+          quotaInfo: { remainingFraction: 0.826, resetTime: '2026-11-19T14:16:20Z' },
+        },
+        {
+          label: 'Claude Sonnet 5.5 (High)',
+          quotaInfo: { remainingFraction: 0.95, resetTime: '2026-11-19T17:06:35Z' },
+        },
+      ],
+    },
+  });
+  assert.ok(parsed);
+  assert.equal(parsed.tierName, 'Google AI Ultra');
+  assert.equal(parsed.pools.length, 2);
+  assert.equal(parsed.pools[0].id, 'gemini');
+  assert.equal(parsed.pools[0].remainingPercent, 83);
+  assert.equal(parsed.pools[1].id, 'claude_gpt');
+  assert.equal(parsed.pools[1].label, 'Claude · GPT');
+  assert.equal(parsed.pools[1].remainingPercent, 95);
+  assert.equal(parsed.byModelId['gemini-4-carbon-high'].remainingPercent, 83);
+
+  const combined = QuotaMonitor.parseCombined(
+    {
+      response: {
+        groups: [
+          {
+            displayName: 'Gemini Models',
+            buckets: [
+              { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.6128, resetTime: '2026-11-25T15:26:30Z' },
+              { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.7519, resetTime: '2026-11-19T14:16:20Z' },
+            ],
+          },
+          {
+            displayName: 'Claude and GPT models',
+            buckets: [
+              { bucketId: '3p-weekly', window: 'weekly', remainingFraction: 1.0, resetTime: '2026-11-26T12:49:58Z' },
+              { bucketId: '3p-5h', window: '5h', remainingFraction: 1.0, resetTime: '2026-11-19T17:49:58Z' },
+            ],
+          },
+        ],
+      },
+    },
+    { userTier: { name: 'Google AI Ultra' } }
+  );
+  assert.equal(combined.tierName, 'Google AI Ultra');
+  assert.equal(combined.pools[0].remainingPercent, 75);
+  assert.equal(combined.pools[0].weeklyPercent, 61);
+  assert.equal(combined.pools[1].remainingPercent, 100);
+  assert.equal(combined.pools[1].weeklyPercent, 100);
+  assert.equal(combined.byModelId['gemini-4-carbon-high'].weeklyPercent, 61);
+  assert.equal(combined.byModelId['gpt-oss-120b-medium'].weeklyPercent, 100);
+});
+
+test('QR SVG generator produces valid crisp SVG for pairing URIs', () => {
+  const uri = 'levity://pair?url=http%3A%2F%2F100.64.0.1%3A19818&token=abc123XYZ_sampleToken987654&name=StudioMac';
+  const svg = generateQrSvg(uri);
+  assert.ok(svg.startsWith('<svg xmlns="http://www.w3.org/2000/svg"'));
+  assert.ok(svg.includes('<path d="M'));
+});
+
+test('BridgeServer handles Desktop titles, PreInvocation userMessage injection, questions, and APNs push', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-test-'));
+  try {
+    const appData = join(sandbox, 'antigravity');
+    const projectsRoot = join(sandbox, 'Projects');
+    mkdirSync(join(projectsRoot, 'AntigravityZ'), { recursive: true });
+    mkdirSync(join(projectsRoot, 'DemoApp'), { recursive: true });
+    mkdirSync(join(appData, 'annotations'), { recursive: true });
+
+    const rootConvId = '11111111-2222-3333-4444-555555555555';
+    const subConvId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
+    const db = new DatabaseSync(join(appData, 'conversation_summaries.db'));
+    db.exec(`
+      CREATE TABLE conversation_summaries (
+        conversation_id text PRIMARY KEY,
+        title text NOT NULL DEFAULT '',
+        preview text NOT NULL DEFAULT '',
+        step_count integer NOT NULL DEFAULT 0,
+        last_modified_time datetime NOT NULL,
+        workspace_uris text NOT NULL,
+        status text NOT NULL DEFAULT '',
+        parent_conversation_id text NOT NULL DEFAULT '',
+        nesting_depth integer NOT NULL DEFAULT 0,
+        not_fully_idle numeric NOT NULL DEFAULT 0,
+        killed numeric NOT NULL DEFAULT 0
+      );
+    `);
+    const ins = db.prepare(
+      `INSERT INTO conversation_summaries
+       (conversation_id, title, last_modified_time, workspace_uris, status, parent_conversation_id, nesting_depth, not_fully_idle, killed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`
+    );
+    ins.run(rootConvId, 'Demo Sync Module', '2026-11-19T01:30:00Z', '', 'CASCADE_RUN_STATUS_IDLE', '', 0, 0);
+    ins.run(subConvId, '', '2026-11-19T01:25:00Z', '', 'CASCADE_RUN_STATUS_IDLE', rootConvId, 1, 0);
+    db.close();
+
+    writeFileSync(
+      join(appData, 'annotations', `${rootConvId}.pbtxt`),
+      'title:"Demo Sync Module"  last_user_view_time:{seconds:1795023268}  pinned:true\n',
+      'utf-8'
+    );
+
+    const rootLogDir = join(appData, 'brain', rootConvId, '.system_generated', 'logs');
+    const subLogDir = join(appData, 'brain', subConvId, '.system_generated', 'logs');
+    mkdirSync(rootLogDir, { recursive: true });
+    mkdirSync(subLogDir, { recursive: true });
+
+    writeFileSync(join(appData, 'brain', rootConvId, 'architecture.md'), '# Architecture Plan\nReady.', 'utf-8');
+
+    const rootTranscript = [
+      JSON.stringify({
+        step_index: 0,
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: '2026-11-19T00:00:01Z',
+        content:
+          '<USER_REQUEST>\n检查一下 DemoApp 的同步模块\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Carbon (High). No need to comment on this change.\n</USER_SETTINGS_CHANGE>',
+      }),
+      JSON.stringify({
+        step_index: 1,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-19T00:00:03Z',
+        thinking: '先读取同步配置',
+        tool_calls: [{ name: 'read_file', args: { Path: join(projectsRoot, 'DemoApp', 'sync.swift') } }],
+      }),
+      JSON.stringify({
+        step_index: 2,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'DONE',
+        created_at: '2026-11-19T00:00:04Z',
+        content: '1: import Foundation',
+      }),
+      JSON.stringify({
+        step_index: 3,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-19T00:00:06Z',
+        content: '同步模块一切正常！',
+      }),
+      // Simulate wakeup SYSTEM_MESSAGE + PreInvocation injected USER_INPUT deduplication
+      // 1) SYSTEM_MESSAGE followed by USER_INPUT
+      JSON.stringify({
+        step_index: 4,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        created_at: '2026-11-19T00:01:00Z',
+        content: '[AntigravityZ_USER_PROMPT id=ios-msg-1]\n<USER_PROMPT>\n顺便加个单元测试\n</USER_PROMPT>',
+      }),
+      JSON.stringify({
+        step_index: 5,
+        source: 'HOOK',
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: '2026-11-19T00:01:01Z',
+        content: '顺便加个单元测试',
+      }),
+      // 2) Real Antigravity 2.0 order: PreInvocation USER_INPUT BEFORE wakeup SYSTEM_MESSAGE!
+      JSON.stringify({
+        step_index: 6,
+        source: 'SYSTEM_SDK',
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: '2026-11-19T00:02:00Z',
+        content: '<USER_REQUEST>\n再检查一下通知逻辑\n</USER_REQUEST>',
+      }),
+      JSON.stringify({
+        step_index: 7,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        created_at: '2026-11-19T00:02:00Z',
+        content: '[AntigravityZ_USER_PROMPT id=ios-msg-real-order]\n<USER_PROMPT>\n再检查一下通知逻辑\n</USER_PROMPT>',
+      }),
+    ].join('\n');
+    writeFileSync(join(rootLogDir, 'transcript_full.jsonl'), rootTranscript, 'utf-8');
+
+    const subTranscript = JSON.stringify({
+      step_index: 0,
+      source: 'USER_EXPLICIT',
+      type: 'USER_INPUT',
+      status: 'DONE',
+      created_at: '2026-11-19T00:00:05Z',
+      content: 'Subagent research task',
+    });
+    writeFileSync(join(subLogDir, 'transcript_full.jsonl'), subTranscript, 'utf-8');
+
+    const metaStore = new MetaStore({ stateDir: join(sandbox, 'state') });
+    const sentCalls = [];
+    const pushedAlerts = [];
+
+    const mockApns = new ApnsPusher({
+      metaStore,
+      sendFn: async (req) => {
+        pushedAlerts.push(req);
+        return { sent: true, status: 200 };
+      },
+    });
+
+    const mockController = new AgentController({
+      agentApiPath: 'mock-agentapi',
+      projectsRoot,
+      expectedMount: sandbox,
+      execFn: async (_bin, args) => {
+        if (args[0] === 'get-conversation-metadata') {
+          const cid = args[1];
+          if (cid === rootConvId) {
+            return {
+              stdout: JSON.stringify({
+                response: {
+                  conversationMetadata: {
+                    metadata: {
+                      workspaceUris: [`file://${join(projectsRoot, 'DemoApp')}`],
+                      parentConversationId: '',
+                      nestingDepth: 0,
+                    },
+                  },
+                },
+              }),
+            };
+          }
+          if (cid === subConvId) {
+            return {
+              stdout: JSON.stringify({
+                response: {
+                  conversationMetadata: {
+                    metadata: {
+                      workspaceUris: [`file://${join(projectsRoot, 'DemoApp')}`],
+                      parentConversationId: rootConvId,
+                      nestingDepth: 1,
+                      subagentSpec: { role: 'Codebase Researcher' },
+                    },
+                  },
+                },
+              }),
+            };
+          }
+        }
+        if (args[0] === 'send-message') {
+          sentCalls.push(args);
+          return { stdout: '{"ok":true}', stderr: '' };
+        }
+        if (args[0] === 'new-conversation') {
+          const newId = '99999999-8888-7777-6666-555555555555';
+          const newLogDir = join(appData, 'brain', newId, '.system_generated', 'logs');
+          mkdirSync(newLogDir, { recursive: true });
+          writeFileSync(
+            join(newLogDir, 'transcript_full.jsonl'),
+            JSON.stringify({
+              step_index: 0,
+              source: 'USER_EXPLICIT',
+              type: 'USER_INPUT',
+              status: 'DONE',
+              created_at: new Date().toISOString(),
+              content: args[args.length - 1],
+            }),
+            'utf-8'
+          );
+          return { stdout: JSON.stringify({ conversationId: newId }), stderr: '' };
+        }
+        return { stdout: '{}', stderr: '' };
+      },
+    });
+
+    const scanner = new BrainScanner({
+      appDataDirs: [appData],
+      projectsRoot,
+      agentController: mockController,
+      metaStore,
+    });
+
+    const scan = await scanner.scanAll();
+    assert.equal(scan.workspaces.length, 1);
+    assert.equal(scan.workspaces[0].name, 'DemoApp');
+    const rootSummary = scan.workspaces[0].conversations[0];
+    assert.equal(rootSummary.title, 'Demo Sync Module');
+    assert.equal(rootSummary.pinned, true);
+    assert.equal(rootSummary.currentModelShort, 'Carbon · High');
+
+    // Verify deduplication in BOTH orders (`SYSTEM_MESSAGE -> USER_INPUT` and `USER_INPUT -> SYSTEM_MESSAGE`)
+    const detail = await scanner.getConversationDetail(rootConvId);
+    assert.equal(detail.items.length, 4);
+    assert.equal(detail.items[2].id, 'ios-msg-1');
+    assert.equal(detail.items[2].origin, 'ios');
+    assert.equal(detail.items[2].content, '顺便加个单元测试');
+    assert.equal(detail.items[3].id, 'ios-msg-real-order');
+    assert.equal(detail.items[3].origin, 'ios');
+    assert.equal(detail.items[3].content, '再检查一下通知逻辑');
+
+    const bridge = new BridgeServer({
+      port: 0,
+      host: '127.0.0.1',
+      metaStore,
+      brainScanner: scanner,
+      agentController: mockController,
+      apnsPusher: mockApns,
+      pollIntervalMs: 60_000,
+    });
+    await bridge.start();
+    const port = bridge.getBoundPort();
+    const token = metaStore.getToken();
+
+    try {
+      // Register APNs token
+      const fakeDeviceToken = 'a1b2c3d4e5f60123456789abcdef0123456789abcdef0123456789abcdef0123';
+      const regRes = await fetch(`http://127.0.0.1:${port}/api/v1/devices/push-token`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          token: fakeDeviceToken,
+          environment: 'production',
+          deviceId: 'ios-dev-1',
+        }),
+      });
+      assert.equal(regRes.status, 200);
+      const regJson = await regRes.json();
+      assert.equal(regJson.apnsConfigured, true);
+
+      // Update model + mode via /settings
+      await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${rootConvId}/settings`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ model: 'gemini-4-hydrogen-xhigh', mode: 'plan' }),
+      });
+
+      // Send message -> queues PreInvocation userMessage injection!
+      const msgRes = await fetch(
+        `http://127.0.0.1:${port}/api/v1/conversations/${rootConvId}/messages`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ text: '再跑一次测试', clientMessageId: 'ios-msg-2' }),
+        }
+      );
+      assert.equal(msgRes.status, 200);
+
+      // Simulate Antigravity PreInvocation hook -> MUST return `injectSteps` with `userMessage`!
+      const preInvRes = await fetch(`http://127.0.0.1:${port}/internal/hook`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-AntigravityZ-Hook-Secret': metaStore.getHookSecret(),
+        },
+        body: JSON.stringify({
+          conversationId: rootConvId,
+          hookEventName: 'PreInvocation',
+        }),
+      });
+      assert.equal(preInvRes.status, 200);
+      const preInvJson = await preInvRes.json();
+      assert.ok(Array.isArray(preInvJson.hookResponse.injectSteps));
+      assert.equal(preInvJson.hookResponse.injectSteps.some((s) => s.userMessage === '再跑一次测试'), true);
+
+      // Second PreInvocation in same turn -> queue already drained, returns empty `{}`!
+      const preInv2 = await (
+        await fetch(`http://127.0.0.1:${port}/internal/hook`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-AntigravityZ-Hook-Secret': metaStore.getHookSecret(),
+          },
+          body: JSON.stringify({
+            conversationId: rootConvId,
+            hookEventName: 'PreInvocation',
+          }),
+        })
+      ).json();
+      assert.deepEqual(preInv2.hookResponse, {});
+
+      // PreToolUse with ask_question -> surfaces pendingInteraction & returns decision: "allow"
+      const preToolJson = await (
+        await fetch(`http://127.0.0.1:${port}/internal/hook`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-AntigravityZ-Hook-Secret': metaStore.getHookSecret(),
+          },
+          body: JSON.stringify({
+            conversationId: rootConvId,
+            hookEventName: 'PreToolUse',
+            toolCall: {
+              id: 'tc-ask-1',
+              name: 'ask_question',
+              args: {
+                questions: [{ question: '选择数据库引擎？', options: ['SQLite', 'Postgres'] }],
+              },
+            },
+          }),
+        })
+      ).json();
+      assert.equal(preToolJson.hookResponse.decision, 'allow');
+      const detDuringQuestion = await scanner.getConversationDetail(rootConvId);
+      assert.equal(detDuringQuestion.pendingInteraction?.kind, 'question');
+      assert.deepEqual(detDuringQuestion.pendingInteraction?.options, ['SQLite', 'Postgres']);
+
+      // Clear tool & simulate Stop hook while device is NOT viewing -> delivers APNs push!
+      await fetch(`http://127.0.0.1:${port}/internal/hook`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-AntigravityZ-Hook-Secret': metaStore.getHookSecret(),
+        },
+        body: JSON.stringify({
+          conversationId: rootConvId,
+          hookEventName: 'Stop',
+          terminationReason: 'NO_TOOL_CALL',
+          continuationActive: false,
+        }),
+      });
+      await new Promise((r) => setTimeout(r, 80));
+      assert.ok(pushedAlerts.length >= 1);
+      const lastPush = pushedAlerts[pushedAlerts.length - 1];
+      assert.equal(lastPush.payload.conversationId, rootConvId);
+      assert.equal(lastPush.payload.aps.alert.title, 'Antigravity');
+      assert.equal(lastPush.payload.aps.alert.subtitle, 'Demo Sync Module');
+
+      // Binary attachment upload + message send + upload download
+      const samplePng = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+      const upRes = await fetch(`http://127.0.0.1:${port}/api/v1/uploads`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'image/png',
+          'X-File-Name': encodeURIComponent('屏幕截图.png'),
+          'X-Conversation-Id': rootConvId,
+        },
+        body: samplePng,
+      });
+      assert.equal(upRes.status, 201);
+      const upJson = await upRes.json();
+      assert.equal(upJson.ok, true);
+      assert.equal(upJson.kind, 'image');
+      assert.equal(upJson.name, '屏幕截图.png');
+
+      const attMsgRes = await fetch(
+        `http://127.0.0.1:${port}/api/v1/conversations/${rootConvId}/messages`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            text: '看看这张截图',
+            clientMessageId: 'ios-msg-att-1',
+            attachments: [upJson.uploadId],
+          }),
+        }
+      );
+      assert.equal(attMsgRes.status, 200);
+      const detWithAtt = await scanner.getConversationDetail(rootConvId);
+      const attBubble = detWithAtt.items.find((it) => it.id === 'ios-msg-att-1');
+      assert.ok(attBubble);
+      assert.equal(attBubble.pending, false);
+      assert.equal(attBubble.attachments.length, 1);
+      assert.equal(attBubble.attachments[0].name, '屏幕截图.png');
+
+      // Verify PreInvocation injects clean `userMessage` with attachment link and NO `systemMessage.metadata`
+      // (Antigravity's protojson hook parser drops the entire `injectSteps` turn if `metadata.user_markdown` is sent).
+      const attPreInvJson = await (
+        await fetch(`http://127.0.0.1:${port}/internal/hook`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-AntigravityZ-Hook-Secret': metaStore.getHookSecret(),
+          },
+          body: JSON.stringify({
+            conversationId: rootConvId,
+            hookEventName: 'PreInvocation',
+          }),
+        })
+      ).json();
+      const userStep = attPreInvJson.hookResponse.injectSteps.find((s) => typeof s.userMessage === 'string');
+      assert.ok(userStep, 'Expected userMessage step in PreInvocation injectSteps');
+      assert.ok(userStep.userMessage.includes('[附件: 屏幕截图.png](file://'));
+      const sysStep = attPreInvJson.hookResponse.injectSteps.find((s) => s.systemMessage);
+      assert.ok(sysStep && sysStep.systemMessage.metadata === undefined, 'Must not include systemMessage.metadata that breaks protojson hook injection');
+
+      // Verify tail pagination (`?limit=2`) and honest Desktop model precedence over stale desiredModel
+      const pagedRes = await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${rootConvId}?limit=2`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      assert.equal(pagedRes.status, 200);
+      const pagedJson = await pagedRes.json();
+      assert.equal(pagedJson.detail.items.length, 2);
+      assert.ok(pagedJson.detail.totalItemCount >= 5);
+      assert.equal(pagedJson.detail.hasMoreHistory, true);
+      assert.equal(pagedJson.detail.currentModelId, 'gemini-4-carbon-high', 'Real Desktop model must take strict precedence over stale desiredModel');
+
+      // Auto-approved BypassSandbox command (EVEN WITHOUT task log and after 30s!) MUST NEVER trigger permission_waiting!
+      const convDbDir = join(appData, 'conversations');
+      mkdirSync(convDbDir, { recursive: true });
+      const convDbPath = join(convDbDir, `${rootConvId}.db`);
+      const cdb = new DatabaseSync(convDbPath);
+      cdb.exec(`
+        CREATE TABLE steps (
+          idx integer PRIMARY KEY,
+          step_type integer NOT NULL DEFAULT 0,
+          status integer NOT NULL DEFAULT 0,
+          permissions blob,
+          step_payload blob
+        );
+      `);
+      // Step 99 is RUNNING (status=2) with permissions=NULL (auto-approved!)
+      cdb.prepare('INSERT INTO steps (idx, step_type, status, permissions, step_payload) VALUES (?, ?, ?, ?, ?)').run(99, 132, 2, null, null);
+      cdb.close();
+
+      scanner.recordHookEvent({
+        conversationId: rootConvId,
+        hookEventName: 'PreToolUse',
+        stepIdx: 99,
+        toolCall: {
+          id: 'tc-auto-99',
+          name: 'run_command',
+          args: { BypassSandbox: true, CommandLine: 'xcodebuild archive' },
+        },
+      });
+      scanner.inFlightTools.get(rootConvId).startedAt = Date.now() - 30_000;
+      const detDuringAutoCmd = await scanner.getConversationDetail(rootConvId);
+      assert.equal(detDuringAutoCmd.pendingInteraction, null);
+
+      // Genuinely blocked permission step in conversations/<id>.db: status=9 WAITING with permissions=NULL (exact live Antigravity behavior!)
+      const fakePayload = Buffer.from(
+        '\x0a\x10call_1234567890\x12\x0brun_command\x1a{"BypassSandbox":true,"CommandLine":"git push origin v0.1.0-build12","toolSummary":"Push v0.1.0-build12 tag to GitHub"}"\x03ask*Pushing the tag modifies remote repository refs and may publish the tag publicly.',
+        'utf8'
+      );
+      const cdb2 = new DatabaseSync(convDbPath);
+      cdb2
+        .prepare('INSERT INTO steps (idx, step_type, status, permissions, step_payload) VALUES (?, ?, ?, ?, ?)')
+        .run(100, 132, 9, null, fakePayload);
+      cdb2.close();
+      scanner.convStepsDbCache.clear();
+      const detDuringRealBlock = await scanner.getConversationDetail(rootConvId);
+      assert.equal(detDuringRealBlock.pendingInteraction?.kind, 'permission_waiting');
+      assert.equal(detDuringRealBlock.pendingInteraction?.title, '等待授权 · Push v0.1.0-build12 tag to GitHub');
+      assert.ok(detDuringRealBlock.pendingInteraction?.prompt.includes('git push origin v0.1.0-build12'));
+      assert.ok(detDuringRealBlock.pendingInteraction?.prompt.includes('modifies remote repository refs'));
+
+      // Once user clicks Allow (status transitions to 2 RUNNING or 3 DONE), permission_waiting clears immediately!
+      const cdb3 = new DatabaseSync(convDbPath);
+      cdb3.prepare('UPDATE steps SET status = 2 WHERE idx = 100').run();
+      cdb3.close();
+      scanner.convStepsDbCache.clear();
+      const detAfterApprove = await scanner.getConversationDetail(rootConvId);
+      assert.equal(detAfterApprove.pendingInteraction, null);
+
+      // Distinct events in the same conversation MUST use distinct collapseIds so Notification Center never eats previous alerts!
+      await mockApns.notifyConversation({
+        conversationId: rootConvId,
+        title: 'Antigravity',
+        body: 'First alert',
+        eventKey: 'evt-1',
+        force: true,
+      });
+      await mockApns.notifyConversation({
+        conversationId: rootConvId,
+        title: 'Antigravity',
+        body: 'Second alert',
+        eventKey: 'evt-2',
+        force: true,
+      });
+      const pushA = pushedAlerts[pushedAlerts.length - 2];
+      const pushB = pushedAlerts[pushedAlerts.length - 1];
+      assert.notEqual(pushA.collapseId, pushB.collapseId);
+
+      const dlRes = await fetch(
+        `http://127.0.0.1:${port}/api/v1/conversations/${rootConvId}/uploads/${encodeURIComponent(upJson.fileName)}`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      assert.equal(dlRes.status, 200);
+      const dlBuf = Buffer.from(await dlRes.arrayBuffer());
+      assert.deepEqual(dlBuf, samplePng);
+
+      // Foreground presence suppression: when actively viewing rootConvId, APNs alert is suppressed!
+      const countBefore = pushedAlerts.length;
+      await fetch(`http://127.0.0.1:${port}/api/v1/devices/presence`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          deviceId: 'ios-dev-1',
+          active: true,
+          visibleConversationId: rootConvId,
+        }),
+      });
+      const supRes = await mockApns.notifyConversation({
+        conversationId: rootConvId,
+        title: 'Antigravity',
+        body: 'Should be suppressed',
+        kind: 'completed',
+      });
+      assert.equal(supRes.suppressed, true);
+      assert.equal(pushedAlerts.length, countBefore);
+
+      // Subagent Stop hook MUST NEVER send user-facing APNs push alerts (`会话 xxxxxxx` spam prevention!)
+      const beforeSubagentStopCount = pushedAlerts.length;
+      const subStopRes = await fetch(`http://127.0.0.1:${port}/internal/hook`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-AntigravityZ-Hook-Secret': metaStore.getHookSecret(),
+        },
+        body: JSON.stringify({
+          conversationId: subConvId,
+          hookEventName: 'Stop',
+          terminationReason: 'COMPLETED',
+        }),
+      });
+      assert.equal(subStopRes.status, 200);
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(pushedAlerts.length, beforeSubagentStopCount, 'Subagent Stop hook must not trigger APNs alert');
+
+      // Push toggle OFF -> DELETE by deviceId unregisters device cleanly
+      const delRes = await fetch(`http://127.0.0.1:${port}/api/v1/devices/push-token`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ deviceId: 'ios-dev-1' }),
+      });
+      assert.equal(delRes.status, 200);
+      assert.equal(metaStore.listPushDevices().length, 0);
+    } finally {
+      await bridge.stop();
+    }
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test('BrainScanner extracts assistant inline artifact images and serves them via uploads route', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-img-test-'));
+  try {
+    const appData = join(sandbox, 'antigravity');
+    const convId = '22222222-3333-4444-5555-666666666666';
+    const convDir = join(appData, 'brain', convId);
+    const logDir = join(convDir, '.system_generated', 'logs');
+    mkdirSync(logDir, { recursive: true });
+
+    const imgPath = join(convDir, 'preview_card.png');
+    const fakePng = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    writeFileSync(imgPath, fakePng);
+
+    const transcript = [
+      JSON.stringify({
+        step_index: 0,
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: '2026-11-20T07:00:00Z',
+        content: '<USER_REQUEST>\n给我看看截图\n</USER_REQUEST>',
+      }),
+      JSON.stringify({
+        step_index: 1,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-20T07:00:05Z',
+        content: `效果图在这里：\n\n![主页预览](${imgPath})\n\n你看看合适吗？`,
+      }),
+    ].join('\n');
+    writeFileSync(join(logDir, 'transcript_full.jsonl'), `${transcript}\n`, 'utf-8');
+
+    const scanner = new BrainScanner({ appDataDirs: [appData] });
+    const detail = await scanner.getConversationDetail(convId);
+    assert.ok(detail);
+    const assistant = detail.items.find((i) => i.role === 'assistant');
+    assert.ok(assistant);
+    assert.equal(assistant.attachments.length, 1);
+    assert.equal(assistant.attachments[0].fileName, 'preview_card.png');
+    assert.equal(assistant.attachments[0].name, '主页预览');
+    assert.equal(assistant.attachments[0].kind, 'image');
+    assert.equal(assistant.attachments[0].mimeType, 'image/png');
+    assert.ok(!assistant.content.includes(imgPath));
+    assert.ok(assistant.content.includes('效果图在这里'));
+    assert.ok(assistant.content.includes('你看看合适吗？'));
+
+    const resolved = scanner.resolveUploadedFilePath(convId, 'preview_card.png');
+    assert.equal(resolved, imgPath);
+    assert.equal(scanner.resolveUploadedFilePath(convId, '../escape.png'), null);
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test('BridgeServer emits workspaces_updated on preview change and resync_required when since_seq exceeds server epoch', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-resync-test-'));
+  try {
+    const appData = join(sandbox, 'antigravity');
+    const stateDir = join(sandbox, 'state');
+    const convId = '33333333-4444-5555-6666-777777777777';
+    const logDir = join(appData, 'brain', convId, '.system_generated', 'logs');
+    mkdirSync(logDir, { recursive: true });
+    const tPath = join(logDir, 'transcript_full.jsonl');
+
+    const writeTranscript = (assistantText) => {
+      const lines = [
+        JSON.stringify({
+          step_index: 0,
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          status: 'DONE',
+          created_at: '2026-11-20T17:00:00Z',
+          content: '<USER_REQUEST>\n检查首页自动刷新\n</USER_REQUEST>',
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-20T17:00:05Z',
+          content: assistantText,
+        }),
+      ];
+      writeFileSync(tPath, `${lines.join('\n')}\n`, 'utf-8');
+    };
+
+    writeTranscript('旧的预览文本');
+
+    const metaStore = new MetaStore({ stateDir });
+    const scanner = new BrainScanner({ appDataDirs: [appData], metaStore });
+    const bridge = new BridgeServer({
+      port: 0,
+      host: '127.0.0.1',
+      metaStore,
+      brainScanner: scanner,
+      agentController: { isAvailable: () => false },
+      pollIntervalMs: 60_000,
+    });
+    await bridge.start();
+    const port = bridge.getBoundPort();
+    const token = metaStore.getToken();
+
+    try {
+      // 1. Same stepCount/messageCount, ONLY lastPreview text updated -> MUST emit workspaces_updated!
+      const seqBefore = bridge.seq;
+      writeTranscript('刚刚完成思考的新预览消息内容');
+      await bridge.pollChanges();
+      assert.ok(bridge.seq > seqBefore, 'pollChanges must detect lastPreview updates even when stepCount is unchanged');
+      assert.ok(
+        bridge.ringBuffer.some((ev) => ev.type === 'workspaces_updated'),
+        'workspaces_updated event must be emitted on preview change'
+      );
+
+      // 2. Client reconnects with stale future since_seq > server.seq -> MUST receive resync_required!
+      const wsUrl = `ws://127.0.0.1:${port}/api/v1/stream?token=${encodeURIComponent(token)}&since_seq=9999`;
+      const receivedTypes = await new Promise((resolve, reject) => {
+        const ws = new WebSocket(wsUrl);
+        const types = [];
+        const timer = setTimeout(() => {
+          ws.close();
+          resolve(types);
+        }, 1200);
+        ws.addEventListener('message', (evt) => {
+          try {
+            const parsed = JSON.parse(String(evt.data));
+            types.push(parsed.type);
+            if (parsed.type === 'resync_required') {
+              clearTimeout(timer);
+              ws.close();
+              resolve(types);
+            }
+          } catch {
+            // ignore
+          }
+        });
+        ws.addEventListener('error', (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+      });
+      assert.ok(receivedTypes.includes('hello'));
+      assert.ok(receivedTypes.includes('resync_required'));
+    } finally {
+      await bridge.stop();
+    }
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test('BridgeServer computes dual-synced hasUnread from Desktop annotations + /read receipts and sets APNs badge', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-unread-test-'));
+  try {
+    const appData = join(sandbox, 'antigravity');
+    const stateDir = join(sandbox, 'state');
+    const annDir = join(appData, 'annotations');
+    mkdirSync(annDir, { recursive: true });
+
+    const convId = '44444444-5555-6666-7777-888888888888';
+    const logDir = join(appData, 'brain', convId, '.system_generated', 'logs');
+    mkdirSync(logDir, { recursive: true });
+
+    const replyEpochSec = Math.floor(Date.now() / 1000) - 30;
+    const oldViewSec = replyEpochSec - 120;
+    writeFileSync(
+      join(annDir, `${convId}.pbtxt`),
+      `title:"Unread Demo" last_user_view_time:{seconds:${oldViewSec} nanos:0} pinned:true\n`,
+      'utf-8'
+    );
+
+    const tLines = [
+      JSON.stringify({
+        step_index: 0,
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: new Date((oldViewSec - 10) * 1000).toISOString(),
+        content: '<USER_REQUEST>\n帮我跑一下验证\n</USER_REQUEST>',
+      }),
+      JSON.stringify({
+        step_index: 1,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: new Date(replyEpochSec * 1000).toISOString(),
+        content: '全部验证完成，请查阅。',
+      }),
+    ];
+    writeFileSync(join(logDir, 'transcript_full.jsonl'), `${tLines.join('\n')}\n`, 'utf-8');
+
+    const metaStore = new MetaStore({ stateDir });
+    const capturedPayloads = [];
+    const mockApns = new ApnsPusher({
+      metaStore,
+      sendFn: async ({ payload }) => {
+        capturedPayloads.push(payload);
+        return { sent: true, status: 200 };
+      },
+    });
+    metaStore.registerPushDevice({
+      token: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
+      environment: 'production',
+      deviceId: 'ios-unread-dev',
+    });
+
+    const scanner = new BrainScanner({ appDataDirs: [appData], metaStore });
+    const bridge = new BridgeServer({
+      port: 0,
+      host: '127.0.0.1',
+      metaStore,
+      brainScanner: scanner,
+      agentController: { isAvailable: () => false },
+      apnsPusher: mockApns,
+      pollIntervalMs: 60_000,
+    });
+    await bridge.start();
+    const port = bridge.getBoundPort();
+    const token = metaStore.getToken();
+
+    try {
+      const boot1 = await (
+        await fetch(`http://127.0.0.1:${port}/api/v1/bootstrap`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ).json();
+      assert.equal(boot1.workspaces[0].conversations[0].hasUnread, true);
+
+      // Stop hook alert should carry aps.badge >= 1
+      await fetch(`http://127.0.0.1:${port}/internal/hook`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-AntigravityZ-Hook-Secret': metaStore.getHookSecret(),
+        },
+        body: JSON.stringify({
+          conversationId: convId,
+          hookEventName: 'Stop',
+          terminationReason: 'COMPLETED',
+        }),
+      });
+      await new Promise((r) => setTimeout(r, 100));
+      assert.ok(capturedPayloads.length >= 1);
+      assert.equal(capturedPayloads[capturedPayloads.length - 1].aps.badge, 1);
+
+      // Marking read via /read must immediately clear hasUnread and unreadCount
+      const readRes = await (
+        await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${convId}/read`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ).json();
+      assert.equal(readRes.ok, true);
+      assert.equal(readRes.unreadCount, 0);
+
+      const boot2 = await (
+        await fetch(`http://127.0.0.1:${port}/api/v1/bootstrap`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ).json();
+      assert.equal(boot2.workspaces[0].conversations[0].hasUnread, false);
+    } finally {
+      await bridge.stop();
+    }
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});

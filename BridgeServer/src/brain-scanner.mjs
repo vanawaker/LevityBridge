@@ -1,0 +1,1619 @@
+/**
+ * BrainScanner — Discovers conversations, reads official `conversation_summaries.db`
+ * (read-only) & `annotations/*.pbtxt` for Desktop-renamed titles and pinned status,
+ * parses untruncated transcripts, active model/thinking settings, and interactive
+ * questions/permission waits, resolves workspace grouping, and nests subagents.
+ */
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, extname, join, resolve as resolvePath, sep } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath } from 'node:url';
+import { lookupModelInfo } from './model-catalog.mjs';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SAFE_CONV_RE = /^[0-9a-zA-Z_-]{6,64}$/;
+const ARTIFACT_EXTS = new Set(['.md', '.png', '.jpg', '.jpeg', '.webp', '.svg', '.txt', '.json']);
+
+function extractSettingsChanges(raw) {
+  if (!raw || typeof raw !== 'string') return { modelName: null };
+  let modelName = null;
+  const re = /<USER_SETTINGS_CHANGE>([\s\S]*?)<\/USER_SETTINGS_CHANGE>/gi;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    const block = m[1];
+    const modelMatch = /setting\s+`Model Selection`\s+from\s+[\s\S]*?\s+to\s+([^.\n]+)\./i.exec(block);
+    if (modelMatch && modelMatch[1]) {
+      modelName = modelMatch[1].trim();
+    }
+  }
+  return { modelName };
+}
+
+function stripUserWrapper(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  const reqMatch = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i.exec(raw);
+  const body = reqMatch
+    ? reqMatch[1]
+    : raw
+        .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, '')
+        .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, '')
+        .replace(/The user has uploaded \d+ attachment\(s\)[\s\S]*$/gi, '');
+  return body
+    .replace(/\n*\[Workspace:\s*[^\]]+\]/g, '')
+    .replace(/\n*\[SESSION_MODE:\s*[^\n]+/g, '')
+    .replace(/(?:\n+\[附件:\s*[^\]]+\]\(file:\/\/[^)]+\))+$/g, '')
+    .trim();
+}
+
+function inferAttachmentKind(mimeOrName = '') {
+  const s = String(mimeOrName || '').toLowerCase();
+  if (s.startsWith('image/') || /\.(png|jpe?g|webp|gif|heic|svg)$/.test(s)) return 'image';
+  if (s.startsWith('video/') || /\.(mp4|mov|m4v|webm)$/.test(s)) return 'video';
+  if (s.startsWith('audio/') || /\.(m4a|mp3|wav|aac|ogg)$/.test(s)) return 'audio';
+  return 'file';
+}
+
+function mimeFromImageExt(fileName = '') {
+  const ext = extname(String(fileName || '')).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.heic') return 'image/heic';
+  return 'image/png';
+}
+
+function extractAssistantInlineImages(rawContent, convDir, stepMedia = null) {
+  const found = new Map();
+  const resolvedConvDir = resolvePath(convDir);
+  const allowedPrefix = resolvedConvDir + sep;
+
+  const tryRegisterLocalImage = (rawTarget, altText = '') => {
+    const cleanTarget = uriToPath(String(rawTarget || '').trim());
+    if (!cleanTarget || !cleanTarget.startsWith('/')) return false;
+    const resolved = resolvePath(cleanTarget);
+    if (!resolved.startsWith(allowedPrefix)) return false;
+    const fName = basename(resolved);
+    if (!fName || fName.startsWith('.') || inferAttachmentKind(fName) !== 'image') return false;
+    let sizeBytes = 0;
+    try {
+      if (!existsSync(resolved)) return false;
+      const st = statSync(resolved);
+      if (!st.isFile()) return false;
+      sizeBytes = st.size;
+    } catch {
+      return false;
+    }
+    if (!found.has(fName)) {
+      found.set(fName, {
+        id: `img-${fName}`,
+        name: (altText || '').trim() || fName,
+        fileName: fName,
+        kind: 'image',
+        mimeType: mimeFromImageExt(fName),
+        sizeBytes,
+      });
+    }
+    return true;
+  };
+
+  if (Array.isArray(stepMedia)) {
+    for (const m of stepMedia) {
+      const uri = String(m?.uri || '').trim();
+      if (uri) tryRegisterLocalImage(uri, '');
+    }
+  }
+
+  let cleaned = String(rawContent || '');
+  if (cleaned) {
+    cleaned = cleaned.replace(/!\[([^\]]*)\]\(([^)\n]+)\)/g, (full, alt, target) => {
+      if (tryRegisterLocalImage(target, alt)) {
+        return '';
+      }
+      return full;
+    });
+    cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  return {
+    cleanedContent: cleaned,
+    attachments: [...found.values()],
+  };
+}
+
+function extractDesktopAttachments(step) {
+  const found = new Map();
+  if (Array.isArray(step?.media)) {
+    for (const m of step.media) {
+      const uri = String(m?.uri || '').trim();
+      const filePath = uri.startsWith('file://') ? uriToPath(uri) : uri;
+      const fName = basename(filePath);
+      if (!fName) continue;
+      let sizeBytes = 0;
+      try {
+        if (filePath && existsSync(filePath)) sizeBytes = statSync(filePath).size;
+      } catch {
+        // Ignore
+      }
+      const mimeType = String(m?.mime_type || m?.mimeType || 'application/octet-stream');
+      found.set(fName, {
+        id: fName,
+        name: fName,
+        fileName: fName,
+        kind: inferAttachmentKind(mimeType || fName),
+        mimeType,
+        sizeBytes,
+      });
+    }
+  }
+  const rawContent = String(step?.content || '');
+  const metaMatch = /<ADDITIONAL_METADATA>([\s\S]*?)<\/ADDITIONAL_METADATA>/i.exec(rawContent);
+  if (metaMatch) {
+    const lineRe = /^-\s*(\/[^\n]+\/\.user_uploaded\/([^\s\n]+))\s*$/gm;
+    let m;
+    while ((m = lineRe.exec(metaMatch[1])) !== null) {
+      const fullPath = m[1].trim();
+      const fName = m[2].trim();
+      if (!fName || found.has(fName)) continue;
+      let sizeBytes = 0;
+      try {
+        if (existsSync(fullPath)) sizeBytes = statSync(fullPath).size;
+      } catch {
+        // Ignore
+      }
+      found.set(fName, {
+        id: fName,
+        name: fName,
+        fileName: fName,
+        kind: inferAttachmentKind(fName),
+        mimeType: inferAttachmentKind(fName) === 'image' ? 'image/jpeg' : 'application/octet-stream',
+        sizeBytes,
+      });
+    }
+  }
+  return [...found.values()];
+}
+
+function extractMobilePrompt(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const switchOnlyMatch = /\[AntigravityZ_MODEL_SWITCH\s+model=([^\s\]]+)\]/.exec(raw);
+  if (switchOnlyMatch) {
+    const info = lookupModelInfo(switchOnlyMatch[1]);
+    return {
+      clientMessageId: null,
+      modelId: switchOnlyMatch[1].trim(),
+      mode: null,
+      isControlOnly: true,
+      text: `切换模型为 ${info ? info.displayName : switchOnlyMatch[1].trim()}`,
+    };
+  }
+  if (!raw.includes('[AntigravityZ_USER_PROMPT')) return null;
+  const headerMatch = /\[AntigravityZ_USER_PROMPT([^\]]*)\]/.exec(raw);
+  const headerAttrs = headerMatch ? headerMatch[1] : '';
+  const idMatch = /\bid=([^\s\]]+)/.exec(headerAttrs);
+  const modelMatch = /\bmodel=([^\s\]]+)/.exec(headerAttrs);
+  const modeMatch = /\bmode=([^\s\]]+)/.exec(headerAttrs);
+  const promptMatch = /<USER_PROMPT>\s*([\s\S]*?)\s*<\/USER_PROMPT>/i.exec(raw);
+  if (!promptMatch) return null;
+  return {
+    clientMessageId: idMatch?.[1]?.trim() || null,
+    modelId: modelMatch?.[1]?.trim() || null,
+    mode: modeMatch?.[1]?.trim() || null,
+    isControlOnly: false,
+    text: promptMatch[1].trim(),
+  };
+}
+
+function parseAskQuestionArgs(args) {
+  if (!args) return null;
+  let questions = args.questions;
+  if (typeof questions === 'string') {
+    try {
+      questions = JSON.parse(questions);
+    } catch {
+      return null;
+    }
+  }
+  if (!Array.isArray(questions) || questions.length === 0) return null;
+  const q0 = questions[0];
+  if (!q0 || typeof q0.question !== 'string') return null;
+  const opts = Array.isArray(q0.options) ? q0.options.map((o) => String(o)) : [];
+  return {
+    question: q0.question.trim(),
+    options: opts,
+    multiSelect: Boolean(q0.is_multi_select),
+  };
+}
+
+function summarizeToolArgs(name, args) {
+  if (!args || typeof args !== 'object') return '';
+  const clean = (v) => String(v ?? '').replace(/^"|"$/g, '');
+  if (args.toolSummary) return clean(args.toolSummary);
+  if (args.Path) return basename(clean(args.Path)) || clean(args.Path);
+  if (args.CommandLine) return clean(args.CommandLine).slice(0, 80);
+  if (args.query) return clean(args.query).slice(0, 80);
+  if (args.Role) return `${clean(args.TypeName || 'subagent')}: ${clean(args.Role)}`;
+  if (name === 'ask_question') {
+    const parsed = parseAskQuestionArgs(args);
+    if (parsed?.question) return parsed.question.slice(0, 80);
+  }
+  if (name === 'swarm' && args.action) {
+    const act = clean(args.action);
+    const mod = args.model ? ` → ${clean(args.model)}` : '';
+    return `swarm ${act}${mod}`;
+  }
+  const firstVal = Object.values(args)[0];
+  return firstVal ? clean(firstVal).slice(0, 60) : name;
+}
+
+function humanizeToolActivity(name, args) {
+  const clean = (v) => String(v ?? '').replace(/^"|"$/g, '').trim();
+  const fileBase = args?.Path ? basename(clean(args.Path)) : '';
+  const summary = args?.toolSummary ? clean(args.toolSummary) : '';
+  switch (name) {
+    case 'read_file':
+    case 'view_file':
+      return fileBase ? `正在读文件 · ${fileBase}` : '正在读文件…';
+    case 'write_file':
+    case 'edit_file':
+      return fileBase ? `正在改代码 · ${fileBase}` : '正在改代码…';
+    case 'run_command':
+      return summary ? `正在跑命令 · ${summary}` : '正在跑命令…';
+    case 'search_web':
+      return '正在搜网页…';
+    case 'invoke_subagent':
+      return args?.Role ? `正在调度子代理 · ${clean(args.Role)}` : '正在调度子代理…';
+    case 'swarm':
+      return '正在切换模型或编排代理…';
+    case 'schedule':
+      return '正在设置定时任务…';
+    case 'ask_question':
+      return '等待你的确认…';
+    default: {
+      const s = summarizeToolArgs(name || 'tool', args);
+      return s ? `正在执行 · ${s}` : '思考中…';
+    }
+  }
+}
+
+function uriToPath(uriOrPath) {
+  if (!uriOrPath || typeof uriOrPath !== 'string') return '';
+  const first = uriOrPath.split(',')[0].trim();
+  if (!first) return '';
+  if (first.startsWith('file://')) {
+    try {
+      return fileURLToPath(first);
+    } catch {
+      return first.replace(/^file:\/\//, '');
+    }
+  }
+  return first;
+}
+
+export class BrainScanner {
+  constructor({
+    appDataDirs = null,
+    projectsRoot = process.env.ANTIGRAVITYZ_PROJECTS_ROOT || join(homedir(), 'Projects'),
+    agentController = null,
+    metaStore = null,
+  } = {}) {
+    this.explicitAppDataDirs = appDataDirs;
+    this.projectsRoot = projectsRoot;
+    this.agentController = agentController;
+    this.metaStore = metaStore;
+    this.transcriptCache = new Map();
+    this.metadataCache = new Map();
+    this.summariesDbCache = new Map();
+    this.convStepsDbCache = new Map();
+    this.subagentsByParent = new Map();
+    this.annotationsCache = new Map();
+    this.liveHooks = new Map();
+    this.inFlightTools = new Map(); // convId -> { id, name, summary, bypassSandbox, commandLine, askQuestion, startedAt }
+  }
+
+  discoverAppDataDirs() {
+    if (Array.isArray(this.explicitAppDataDirs) && this.explicitAppDataDirs.length > 0) {
+      return this.explicitAppDataDirs.filter((d) => existsSync(join(d, 'brain')));
+    }
+    const candidates = [];
+    const execDataDir = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR;
+    if (execDataDir) {
+      let cur = execDataDir;
+      while (cur && cur !== resolvePath(cur, '..')) {
+        if (basename(cur) === 'sidecar_data') {
+          const parent = resolvePath(cur, '..');
+          if (existsSync(join(parent, 'brain'))) candidates.push(parent);
+          break;
+        }
+        cur = resolvePath(cur, '..');
+      }
+    }
+    const geminiRoot = join(homedir(), '.gemini');
+    for (const sub of ['antigravity', 'antigravity-ide', 'antigravity-cli']) {
+      const full = join(geminiRoot, sub);
+      if (!candidates.includes(full) && existsSync(join(full, 'brain'))) {
+        candidates.push(full);
+      }
+    }
+    return candidates;
+  }
+
+  readDesktopSummariesIndex(appData) {
+    const dbPath = join(appData, 'conversation_summaries.db');
+    const result = new Map();
+
+    if (existsSync(dbPath)) {
+      try {
+        const dbStat = statSync(dbPath);
+        const walPath = `${dbPath}-wal`;
+        const walStat = existsSync(walPath) ? statSync(walPath) : null;
+        const cacheKey = `${dbStat.mtimeMs}:${dbStat.size}:${walStat?.mtimeMs || 0}:${walStat?.size || 0}`;
+        const cached = this.summariesDbCache.get(appData);
+        if (cached && cached.key === cacheKey) {
+          for (const [k, v] of cached.map.entries()) {
+            result.set(k, { ...v });
+          }
+        } else {
+          const freshMap = new Map();
+          const db = new DatabaseSync(dbPath, { readOnly: true });
+          try {
+            const rows = db
+              .prepare(
+                `SELECT conversation_id, title, workspace_uris, status, parent_conversation_id, nesting_depth, not_fully_idle, killed, last_modified_time
+                 FROM conversation_summaries`
+              )
+              .all();
+            for (const row of rows) {
+              if (!row?.conversation_id) continue;
+              const modifiedMs = row.last_modified_time ? Date.parse(row.last_modified_time) || 0 : 0;
+              freshMap.set(row.conversation_id, {
+                title: typeof row.title === 'string' ? row.title.trim() : '',
+                workspaceUri: typeof row.workspace_uris === 'string' ? row.workspace_uris.trim() : '',
+                status: typeof row.status === 'string' ? row.status.trim() : '',
+                parentConversationId: typeof row.parent_conversation_id === 'string' ? row.parent_conversation_id.trim() : '',
+                nestingDepth: Number(row.nesting_depth || 0),
+                notFullyIdle: Boolean(row.not_fully_idle),
+                killed: Boolean(row.killed),
+                modifiedMs,
+                pinned: false,
+              });
+            }
+            try {
+              const parentRows = db
+                .prepare(`SELECT conversation_id, parent_id FROM conversation_parents`)
+                .all();
+              for (const pr of parentRows) {
+                if (!pr?.conversation_id || !pr?.parent_id) continue;
+                const existing = freshMap.get(pr.conversation_id);
+                if (existing) {
+                  if (!existing.parentConversationId) {
+                    existing.parentConversationId = String(pr.parent_id).trim();
+                  }
+                  existing.nestingDepth = Math.max(existing.nestingDepth || 0, 1);
+                } else {
+                  freshMap.set(pr.conversation_id, {
+                    title: '',
+                    workspaceUri: '',
+                    status: '',
+                    parentConversationId: String(pr.parent_id).trim(),
+                    nestingDepth: 1,
+                    notFullyIdle: false,
+                    killed: false,
+                    modifiedMs: 0,
+                    pinned: false,
+                  });
+                }
+              }
+            } catch {
+              // Optional table in synthetic test DBs
+            }
+          } finally {
+            db.close();
+          }
+          this.summariesDbCache.set(appData, { key: cacheKey, map: freshMap });
+          for (const [k, v] of freshMap.entries()) {
+            result.set(k, { ...v });
+          }
+        }
+      } catch {
+        // Ignore transient SQLite lock/checkpoint states
+      }
+    }
+
+    const annDir = join(appData, 'annotations');
+    if (existsSync(annDir)) {
+      try {
+        for (const entry of readdirSync(annDir, { withFileTypes: true })) {
+          if (!entry.isFile() || !entry.name.endsWith('.pbtxt')) continue;
+          const convId = entry.name.slice(0, -'.pbtxt'.length);
+          const fPath = join(annDir, entry.name);
+          const st = statSync(fPath);
+          let ann = this.annotationsCache.get(fPath);
+          if (!ann || ann.mtimeMs !== st.mtimeMs) {
+            const txt = readFileSync(fPath, 'utf-8');
+            const pinned = /\bpinned:\s*true\b/.test(txt);
+            const viewMatch = /last_user_view_time:\s*\{\s*seconds:\s*(\d+)(?:\s+nanos:\s*(\d+))?\s*\}/.exec(txt);
+            const lastUserViewMs = viewMatch
+              ? Number(viewMatch[1]) * 1000 + Math.floor(Number(viewMatch[2] || 0) / 1e6)
+              : 0;
+            ann = { mtimeMs: st.mtimeMs, pinned, lastUserViewMs };
+            this.annotationsCache.set(fPath, ann);
+          }
+          const existing = result.get(convId) || {
+            title: '',
+            workspaceUri: '',
+            status: '',
+            parentConversationId: '',
+            nestingDepth: 0,
+            notFullyIdle: false,
+            killed: false,
+            modifiedMs: st.mtimeMs,
+            pinned: false,
+            lastUserViewMs: 0,
+          };
+          existing.pinned = Boolean(ann.pinned);
+          existing.lastUserViewMs = Math.max(existing.lastUserViewMs || 0, ann.lastUserViewMs || 0);
+          result.set(convId, existing);
+        }
+      } catch {
+        // Ignore annotation parse errors
+      }
+    }
+
+    return result;
+  }
+
+  recordHookEvent(payload) {
+    const convId = payload?.conversationId;
+    if (!convId || !SAFE_CONV_RE.test(convId)) return null;
+    const hookName = String(payload.hookEventName || '');
+    const toolCall = payload?.toolCall || null;
+    const toolName = toolCall?.name || null;
+    const prev = this.liveHooks.get(convId) || {};
+    const workspacePaths = Array.isArray(payload.workspacePaths) && payload.workspacePaths.length > 0
+      ? payload.workspacePaths
+      : (payload.cwd ? [payload.cwd] : prev.workspacePaths || []);
+
+    let activity = prev.activity || 'idle';
+    let detail = prev.detail || '';
+    if (hookName === 'SessionStart') {
+      this.inFlightTools.delete(convId);
+      activity = 'thinking';
+      detail = '思考中…';
+    } else if (hookName === 'PreInvocation') {
+      this.inFlightTools.delete(convId);
+      activity = 'thinking';
+      detail = '思考中…';
+    } else if (hookName === 'PreToolUse') {
+      const args = toolCall?.args || {};
+      const clean = (v) => String(v ?? '').replace(/^"|"$/g, '');
+      const bypass = args.BypassSandbox === true || clean(args.BypassSandbox) === 'true';
+      const summary = summarizeToolArgs(toolName || 'tool', args);
+      const askQuestion = toolName === 'ask_question' ? parseAskQuestionArgs(args) : null;
+      const hookStepIdx = typeof payload.stepIdx === 'number' ? payload.stepIdx : null;
+      this.inFlightTools.set(convId, {
+        id: toolCall?.id || `pre-${Date.now()}`,
+        stepIdx: hookStepIdx,
+        name: toolName || 'tool',
+        summary,
+        bypassSandbox: bypass,
+        commandLine: clean(args.CommandLine),
+        askQuestion,
+        startedAt: Date.now(),
+      });
+      activity = askQuestion ? 'waiting' : 'working';
+      detail = askQuestion ? '等待你的确认…' : humanizeToolActivity(toolName || 'tool', args);
+    } else if (hookName === 'PostToolUse') {
+      this.inFlightTools.delete(convId);
+      activity = 'thinking';
+      detail = '思考中…';
+    } else if (hookName === 'PostInvocation') {
+      this.inFlightTools.delete(convId);
+      activity = 'working';
+      detail = '正在回复…';
+    } else if (hookName === 'Stop') {
+      this.inFlightTools.delete(convId);
+      activity = 'idle';
+      detail = '';
+    }
+
+    const entry = {
+      conversationId: convId,
+      hookEventName: hookName,
+      activity,
+      detail,
+      toolName,
+      workspacePaths,
+      modelName: payload.modelName || prev.modelName || null,
+      updatedAt: Date.now(),
+    };
+    this.liveHooks.set(convId, entry);
+
+    if (this.metaStore && workspacePaths.length > 0) {
+      this.metaStore.rememberWorkspace(convId, workspacePaths[0]);
+    }
+    return entry;
+  }
+
+  listKnownProjectFolders() {
+    const seen = new Map();
+    const roots = [this.projectsRoot];
+    const homeProjects = join(homedir(), 'Projects');
+    if (!roots.includes(homeProjects)) roots.push(homeProjects);
+
+    for (const root of roots) {
+      try {
+        if (!existsSync(root)) continue;
+        for (const d of readdirSync(root, { withFileTypes: true })) {
+          if (d.isDirectory() && !d.name.startsWith('.') && !seen.has(d.name)) {
+            seen.set(d.name, { name: d.name, path: join(root, d.name) });
+          }
+        }
+      } catch {
+        // Ignore unreadable directories
+      }
+    }
+    return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  findTranscriptPath(convDir) {
+    const fullPath = join(convDir, '.system_generated', 'logs', 'transcript_full.jsonl');
+    if (existsSync(fullPath)) return fullPath;
+    const compactPath = join(convDir, '.system_generated', 'logs', 'transcript.jsonl');
+    if (existsSync(compactPath)) return compactPath;
+    return null;
+  }
+
+  parseTranscript(convDir) {
+    const emptyResult = {
+      items: [],
+      firstUserText: '',
+      lastPreview: '',
+      lastTimestamp: null,
+      lastAssistantReplyMs: 0,
+      stepCount: 0,
+      lastStepIndex: null,
+      lastStepType: null,
+      inferredWorkspace: null,
+      detectedModelRaw: null,
+      detectedMode: null,
+      unansweredQuestion: null,
+      spawnedSubagents: [],
+      mtimeMs: 0,
+    };
+    const tPath = this.findTranscriptPath(convDir);
+    if (!tPath) return emptyResult;
+    let st;
+    try {
+      st = statSync(tPath);
+    } catch {
+      return emptyResult;
+    }
+
+    const cacheKey = `${st.mtimeMs}:${st.size}`;
+    const cached = this.transcriptCache.get(tPath);
+    if (cached && cached.key === cacheKey) return cached.parsed;
+
+    const rawText = readFileSync(tPath, 'utf-8');
+    const lines = rawText.split('\n');
+    const items = [];
+    const spawnedSubagents = [];
+    let firstUserText = '';
+    let lastPreview = '';
+    let lastTimestamp = null;
+    let lastAssistantReplyMs = 0;
+    let stepCount = 0;
+    let lastStepIndex = null;
+    let lastStepType = null;
+    let detectedModelRaw = null;
+    let detectedMode = null;
+    let unansweredQuestion = null;
+    let pendingToolBatch = null;
+    const workspaceScores = new Map();
+    const candidateRoots = [this.projectsRoot];
+    const homeProjects = join(homedir(), 'Projects');
+    if (!candidateRoots.includes(homeProjects)) candidateRoots.push(homeProjects);
+
+    const scoreTextForProjects = (str, weight) => {
+      if (!str || typeof str !== 'string') return;
+      for (const root of candidateRoots) {
+        const prefix = root + sep;
+        let idx = str.indexOf(prefix);
+        while (idx !== -1) {
+          const rest = str.slice(idx + prefix.length);
+          const projName = rest.split(/[/\s"'`\\]/)[0];
+          if (projName && !projName.startsWith('.')) {
+            const fullProj = join(root, projName);
+            workspaceScores.set(fullProj, (workspaceScores.get(fullProj) || 0) + weight);
+          }
+          idx = str.indexOf(prefix, idx + prefix.length);
+        }
+      }
+    };
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let step;
+      try {
+        step = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      stepCount++;
+      const stepIdx = typeof step.step_index === 'number' ? step.step_index : stepCount - 1;
+      lastStepIndex = stepIdx;
+      const createdAt = step.created_at || null;
+      if (createdAt) lastTimestamp = createdAt;
+      lastStepType = step.type || null;
+
+      if (step.type === 'USER_INPUT') {
+        pendingToolBatch = null;
+        unansweredQuestion = null;
+        const rawContent = step.content || '';
+        const settings = extractSettingsChanges(rawContent);
+        if (settings.modelName) {
+          detectedModelRaw = settings.modelName;
+        }
+        const desktopAtts = extractDesktopAttachments(step);
+        const text = stripUserWrapper(rawContent);
+        if (!text && desktopAtts.length === 0) continue;
+        if (text) scoreTextForProjects(text, 2);
+        if (!firstUserText && text) firstUserText = text;
+        lastPreview = (text || `[附件] ${desktopAtts.map((a) => a.name).join('、')}`).slice(0, 140);
+
+        // Deduplicate if `[AntigravityZ_USER_PROMPT]` SYSTEM_MESSAGE arrived right before USER_INPUT
+        const prevItem = items[items.length - 1];
+        if (
+          prevItem &&
+          prevItem.role === 'user' &&
+          prevItem.origin === 'ios' &&
+          (prevItem.content === text || text.startsWith(prevItem.content))
+        ) {
+          prevItem.stepIndex = stepIdx;
+          prevItem.createdAt = createdAt || prevItem.createdAt;
+          if (desktopAtts.length > 0 && (!prevItem.attachments || prevItem.attachments.length === 0)) {
+            prevItem.attachments = desktopAtts;
+          }
+          continue;
+        }
+
+        items.push({
+          id: `step-${stepIdx}`,
+          stepIndex: stepIdx,
+          role: 'user',
+          origin: step.source === 'USER_EXPLICIT' ? 'desktop' : 'ios',
+          content: text,
+          thinking: null,
+          toolCalls: [],
+          attachments: desktopAtts,
+          createdAt,
+        });
+      } else if (step.type === 'SYSTEM_MESSAGE') {
+        const mobile = extractMobilePrompt(step.content || '');
+        if (mobile && mobile.text) {
+          pendingToolBatch = null;
+          unansweredQuestion = null;
+          if (mobile.mode) detectedMode = mobile.mode;
+          if (!firstUserText && !mobile.isControlOnly) firstUserText = mobile.text;
+          lastPreview = mobile.text.slice(0, 140);
+
+          // Deduplicate when PreInvocation hook injected `USER_INPUT` right BEFORE `[AntigravityZ_USER_PROMPT]` SYSTEM_MESSAGE!
+          const prevItem = items[items.length - 1];
+          if (
+            prevItem &&
+            prevItem.role === 'user' &&
+            (prevItem.content === mobile.text || prevItem.content.startsWith(mobile.text))
+          ) {
+            if (mobile.clientMessageId) {
+              prevItem.id = mobile.clientMessageId;
+            }
+            prevItem.origin = 'ios';
+            prevItem.content = mobile.text;
+            prevItem.stepIndex = stepIdx;
+            prevItem.createdAt = createdAt || prevItem.createdAt;
+            continue;
+          }
+
+          items.push({
+            id: mobile.clientMessageId || `step-${stepIdx}`,
+            stepIndex: stepIdx,
+            role: 'user',
+            origin: 'ios',
+            content: mobile.text,
+            thinking: null,
+            toolCalls: [],
+            attachments: [],
+            createdAt,
+          });
+        }
+      } else if (step.type === 'PLANNER_RESPONSE') {
+        const rawToolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+        const cleanVal = (v) => String(v ?? '').replace(/^"|"$/g, '').trim();
+        const mappedTools = rawToolCalls.map((tc, i) => {
+          const args = tc?.args || {};
+          const tName = tc?.name || 'tool';
+          const cleanPath = cleanVal(args.Path);
+          const weight = (tName === 'write_file' || tName === 'edit_file') ? 5 : (tName === 'run_command' ? 3 : 1);
+          scoreTextForProjects(cleanPath, weight);
+          if (args.CommandLine) scoreTextForProjects(String(args.CommandLine), 3);
+
+          if (tName === 'swarm' && cleanVal(args.action) === 'model') {
+            const targetName = cleanVal(args.name);
+            const targetModel = cleanVal(args.model);
+            if (targetModel && (!targetName || targetName === 'coordinator')) {
+              detectedModelRaw = targetModel;
+            }
+          }
+          if (tName === 'ask_question') {
+            const parsedQ = parseAskQuestionArgs(args);
+            if (parsedQ) {
+              unansweredQuestion = {
+                id: tc?.id || `ask-${stepIdx}-${i}`,
+                kind: 'question',
+                title: '等待你的确认',
+                prompt: parsedQ.question,
+                options: parsedQ.options,
+                multiSelect: parsedQ.multiSelect,
+              };
+            }
+          }
+          if (tName === 'invoke_subagent') {
+            spawnedSubagents.push({
+              role: cleanVal(args.Role || 'Subagent'),
+              typeName: cleanVal(args.TypeName || 'subagent'),
+            });
+          }
+          return {
+            id: tc?.id || `tc-${stepIdx}-${i}`,
+            name: tName,
+            summary: summarizeToolArgs(tName, args),
+            status: 'done',
+            outputPreview: '',
+          };
+        });
+
+        const rawAssistantContent = typeof step.content === 'string' ? step.content.trim() : '';
+        const { cleanedContent: content, attachments: assistantAtts } = extractAssistantInlineImages(
+          rawAssistantContent,
+          convDir,
+          step.media
+        );
+        const thinking = typeof step.thinking === 'string' ? step.thinking.trim() : '';
+        if (content || assistantAtts.length > 0) {
+          const replyMs = createdAt ? Date.parse(createdAt) : 0;
+          const effectiveReplyMs = Number.isFinite(replyMs) && replyMs > 0 ? replyMs : st.mtimeMs;
+          if (effectiveReplyMs > lastAssistantReplyMs) {
+            lastAssistantReplyMs = effectiveReplyMs;
+          }
+        }
+        if (content) {
+          lastPreview = content.replace(/\s+/g, ' ').slice(0, 140);
+        } else if (assistantAtts.length > 0) {
+          lastPreview = `[图片] ${assistantAtts.map((a) => a.name).join('、')}`.slice(0, 140);
+        }
+
+        const assistantItem = {
+          id: `step-${stepIdx}`,
+          stepIndex: stepIdx,
+          role: 'assistant',
+          origin: 'agent',
+          content,
+          thinking: thinking || null,
+          toolCalls: mappedTools,
+          attachments: assistantAtts,
+          createdAt,
+        };
+        items.push(assistantItem);
+        pendingToolBatch = mappedTools.length > 0 ? { tools: mappedTools, cursor: 0 } : null;
+      } else if (step.type === 'GENERIC' && pendingToolBatch) {
+        const targetTool = pendingToolBatch.tools[pendingToolBatch.cursor];
+        if (targetTool) {
+          const out = String(step.content || '').trim();
+          targetTool.outputPreview = out.slice(0, 600);
+          targetTool.status = step.status === 'ERROR' ? 'error' : 'done';
+          if (targetTool.name === 'ask_question' && step.status === 'DONE') {
+            unansweredQuestion = null;
+          }
+          const convMatch = /conversationId["\s:=]+([0-9a-f-]{36})/i.exec(out);
+          if (convMatch && targetTool.name === 'invoke_subagent') {
+            targetTool.subagentConversationId = convMatch[1];
+          }
+          pendingToolBatch.cursor++;
+        }
+      } else if (step.type === 'ERROR_MESSAGE' || step.status === 'ERROR') {
+        const errText = String(step.content || '执行过程中出现错误').trim();
+        lastPreview = errText.slice(0, 140);
+        const errMs = createdAt ? Date.parse(createdAt) : 0;
+        const effectiveErrMs = Number.isFinite(errMs) && errMs > 0 ? errMs : st.mtimeMs;
+        if (effectiveErrMs > lastAssistantReplyMs) {
+          lastAssistantReplyMs = effectiveErrMs;
+        }
+        items.push({
+          id: `step-${stepIdx}`,
+          stepIndex: stepIdx,
+          role: 'error',
+          origin: 'system',
+          content: errText,
+          thinking: null,
+          toolCalls: [],
+          createdAt,
+        });
+      }
+    }
+
+    const mergedItems = [];
+    for (const item of items) {
+      const prev = mergedItems[mergedItems.length - 1];
+      if (
+        prev &&
+        prev.role === 'assistant' &&
+        item.role === 'assistant' &&
+        !prev.content &&
+        (!prev.attachments || prev.attachments.length === 0)
+      ) {
+        if (item.thinking) {
+          prev.thinking = prev.thinking ? `${prev.thinking}\n\n${item.thinking}` : item.thinking;
+        }
+        prev.toolCalls.push(...item.toolCalls);
+        if (item.content) prev.content = item.content;
+        if (Array.isArray(item.attachments) && item.attachments.length > 0) {
+          prev.attachments = [...(prev.attachments || []), ...item.attachments];
+        }
+        prev.stepIndex = item.stepIndex;
+        prev.createdAt = item.createdAt || prev.createdAt;
+      } else {
+        mergedItems.push({
+          ...item,
+          toolCalls: [...item.toolCalls],
+          attachments: Array.isArray(item.attachments) ? [...item.attachments] : [],
+        });
+      }
+    }
+
+    let inferredWorkspace = null;
+    let bestScore = 0;
+    for (const [projPath, sc] of workspaceScores.entries()) {
+      if (sc > bestScore) {
+        bestScore = sc;
+        inferredWorkspace = projPath;
+      }
+    }
+
+    const parsed = {
+      items: mergedItems,
+      firstUserText,
+      lastPreview,
+      lastTimestamp,
+      lastAssistantReplyMs,
+      stepCount,
+      lastStepIndex,
+      lastStepType,
+      inferredWorkspace,
+      detectedModelRaw,
+      detectedMode,
+      unansweredQuestion,
+      spawnedSubagents,
+      mtimeMs: st.mtimeMs,
+    };
+    this.transcriptCache.set(tPath, { key: cacheKey, parsed });
+    return parsed;
+  }
+
+  #extractPromptFromPermissionsBlob(rawBlob) {
+    if (!rawBlob) return '';
+    try {
+      const buf = Buffer.from(rawBlob);
+      const ascii = buf.toString('utf8');
+      const matches = ascii.match(/[\x20-\x7e\u4e00-\u9fff]{6,}/g) || [];
+      const cleaned = matches
+        .map((s) => s.trim())
+        .filter((s) => s !== 'command' && !s.startsWith('*.command'));
+      if (cleaned.length > 0) {
+        cleaned.sort((a, b) => b.length - a.length);
+        return cleaned[0].slice(0, 180);
+      }
+    } catch {
+      // Ignore malformed blob
+    }
+    return '';
+  }
+
+  #extractWaitingStepDetails(row, matchingInFlight = null) {
+    let toolName = matchingInFlight?.name || '';
+    let toolSummary = matchingInFlight?.summary || '';
+    let commandLine = matchingInFlight?.commandLine || '';
+    let targetPath = '';
+    let askReason = '';
+    let parsedArgs = null;
+
+    if (row?.step_payload) {
+      try {
+        const rawLatin = Buffer.from(row.step_payload).toString('latin1');
+        const rawUtf8 = Buffer.from(row.step_payload).toString('utf8');
+
+        const toolMatch = /call_[0-9A-Za-z_]+[\x00-\x1f]+([a-z][a-z0-9_]{1,40})[\x00-\x1f]+/.exec(rawLatin);
+        if (toolMatch?.[1] && !toolName) {
+          toolName = toolMatch[1];
+        }
+
+        const jsonMatch = /(\{"[A-Za-z0-9_]+"[\s\S]{2,2000}?\})/.exec(rawUtf8);
+        if (jsonMatch?.[1]) {
+          try {
+            parsedArgs = JSON.parse(jsonMatch[1]);
+            if (typeof parsedArgs.toolSummary === 'string' && parsedArgs.toolSummary.trim()) {
+              toolSummary = parsedArgs.toolSummary.trim();
+            }
+            if (typeof parsedArgs.CommandLine === 'string' && parsedArgs.CommandLine.trim()) {
+              commandLine = parsedArgs.CommandLine.trim();
+            }
+            if (typeof parsedArgs.Path === 'string' && parsedArgs.Path.trim()) {
+              targetPath = parsedArgs.Path.trim();
+            }
+          } catch {
+            // Ignore partial JSON match
+          }
+        }
+
+        const askIdx = rawUtf8.indexOf('\x03ask*');
+        if (askIdx !== -1) {
+          const afterAsk = rawUtf8.slice(askIdx + 5, askIdx + 460);
+          const reasonMatch = /([A-Z\u4e00-\u9fff][\x20-\x7e\u4e00-\u9fff]{12,360})/.exec(afterAsk);
+          if (reasonMatch?.[1]) {
+            askReason = reasonMatch[1].trim();
+          }
+        }
+      } catch {
+        // Ignore payload parse errors
+      }
+    }
+
+    if (toolName === 'ask_question' && parsedArgs) {
+      const q = parseAskQuestionArgs(parsedArgs);
+      if (q) {
+        return {
+          id: `ask-step-${row.idx}`,
+          kind: 'question',
+          title: '等待你的确认',
+          prompt: q.question,
+          options: q.options,
+          multiSelect: q.multiSelect,
+        };
+      }
+    }
+
+    const decodedPerm = this.#extractPromptFromPermissionsBlob(row?.permissions);
+    const primaryTarget = commandLine || targetPath || decodedPerm || toolSummary;
+    const promptParts = [];
+    if (primaryTarget) promptParts.push(primaryTarget);
+    if (askReason && askReason !== primaryTarget) promptParts.push(askReason);
+
+    return {
+      id: `perm-step-${row.idx}`,
+      kind: 'permission_waiting',
+      title: toolSummary ? `等待授权 · ${toolSummary}` : '桌面端等待系统授权',
+      prompt: promptParts.join('\n') || '请在电脑端或网页版确认权限请求',
+      options: [],
+      multiSelect: false,
+    };
+  }
+
+  /**
+   * Authoritative permission-wait check backed directly by Antigravity 2.0's live SQLite trajectory DB
+   * (`~/.gemini/antigravity/conversations/<convId>.db`).
+   *
+   * Verified against live Antigravity 2.0 step state machine:
+   * - `status = 1`: PENDING (queued), `status = 2`: RUNNING (including Auto-mode LLM safety check), `status = 3`: DONE.
+   * - `status = 9`: `CORTEX_STEP_STATUS_WAITING` ("Waiting for user input.") — entered ONLY when manual user approval
+   *   is required! Crucially, `permissions` remains `NULL` while `status = 9` (it is only populated AFTER the user
+   *   submits their decision), while `step_payload` already holds the tool args & safety review reason.
+   */
+  readAuthoritativePermissionWait(convId, convDir, inFlight = null) {
+    if (!convDir) return null;
+    const appDataDir = resolvePath(convDir, '..', '..');
+    const dbPath = join(appDataDir, 'conversations', `${convId}.db`);
+    if (!existsSync(dbPath)) return null;
+
+    try {
+      const now = Date.now();
+      const dbStat = statSync(dbPath);
+      const walPath = `${dbPath}-wal`;
+      const walStat = existsSync(walPath) ? statSync(walPath) : null;
+      const cacheKey = `${dbStat.mtimeMs}:${dbStat.size}:${walStat?.mtimeMs || 0}:${walStat?.size || 0}`;
+      const cached = this.convStepsDbCache.get(dbPath);
+      if (cached && cached.key === cacheKey && now - cached.checkedAt < 900) {
+        return cached.waiting;
+      }
+
+      let waiting = null;
+      const db = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        let row = null;
+        try {
+          row = db
+            .prepare(
+              `SELECT idx, status, permissions, step_payload
+               FROM steps
+               WHERE status = 9
+               ORDER BY idx DESC
+               LIMIT 1`
+            )
+            .get();
+        } catch {
+          row = db
+            .prepare(
+              `SELECT idx, status, permissions
+               FROM steps
+               WHERE status = 9
+               ORDER BY idx DESC
+               LIMIT 1`
+            )
+            .get();
+        }
+        if (row) {
+          const matchingInFlight = inFlight && inFlight.stepIdx === row.idx ? inFlight : null;
+          waiting = this.#extractWaitingStepDetails(row, matchingInFlight);
+        }
+      } finally {
+        db.close();
+      }
+      this.convStepsDbCache.set(dbPath, { key: cacheKey, checkedAt: now, waiting });
+      return waiting;
+    } catch {
+      return null;
+    }
+  }
+
+  resolvePendingInteraction(convId, parsedTranscript, convDir = null) {
+    const inFlight = this.inFlightTools.get(convId);
+    if (inFlight) {
+      if (inFlight.askQuestion) {
+        return {
+          id: inFlight.id,
+          kind: 'question',
+          title: '等待你的确认',
+          prompt: inFlight.askQuestion.question,
+          options: inFlight.askQuestion.options,
+          multiSelect: inFlight.askQuestion.multiSelect,
+        };
+      }
+      if (
+        inFlight.stepIdx !== null &&
+        parsedTranscript.lastStepIndex !== null &&
+        parsedTranscript.lastStepIndex >= inFlight.stepIdx
+      ) {
+        this.inFlightTools.delete(convId);
+      }
+    }
+
+    const authPermissionWait = this.readAuthoritativePermissionWait(convId, convDir, inFlight);
+    if (authPermissionWait) {
+      return authPermissionWait;
+    }
+
+    if (parsedTranscript.unansweredQuestion) {
+      return parsedTranscript.unansweredQuestion;
+    }
+    return null;
+  }
+
+  listArtifacts(convDir) {
+    try {
+      const entries = readdirSync(convDir, { withFileTypes: true });
+      const artifacts = [];
+      for (const entry of entries) {
+        if (!entry.isFile() || entry.name.startsWith('.')) continue;
+        const ext = extname(entry.name).toLowerCase();
+        if (!ARTIFACT_EXTS.has(ext)) continue;
+        const full = join(convDir, entry.name);
+        const st = statSync(full);
+        artifacts.push({
+          name: entry.name,
+          ext,
+          kind: ['.png', '.jpg', '.jpeg', '.webp', '.svg'].includes(ext) ? 'image' : 'markdown',
+          sizeBytes: st.size,
+          updatedAt: new Date(st.mtimeMs).toISOString(),
+        });
+      }
+      return artifacts.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    } catch {
+      return [];
+    }
+  }
+
+  async resolveMetadata(convId) {
+    const now = Date.now();
+    const cached = this.metadataCache.get(convId);
+    if (cached && now - cached.fetchedAt < 600_000) {
+      return cached.meta;
+    }
+    if (!this.agentController) return null;
+    try {
+      const meta = await this.agentController.getConversationMetadata(convId);
+      if (meta) {
+        this.metadataCache.set(convId, { fetchedAt: now, meta });
+      }
+      return meta;
+    } catch {
+      return cached?.meta || null;
+    }
+  }
+
+  computeRunState(convId, parsedTranscript, dbEntry = null, pendingInteraction = null) {
+    if (pendingInteraction?.kind === 'permission_waiting') {
+      return {
+        state: 'running',
+        activity: 'waiting',
+        detail: '桌面端等待系统授权…',
+      };
+    }
+    if (pendingInteraction?.kind === 'question') {
+      return {
+        state: 'running',
+        activity: 'waiting',
+        detail: '等待你的确认…',
+      };
+    }
+
+    const hook = this.liveHooks.get(convId);
+    const now = Date.now();
+    if (hook && now - hook.updatedAt < 90_000 && hook.activity !== 'idle') {
+      return {
+        state: 'running',
+        activity: hook.activity,
+        detail: hook.detail || '思考中…',
+      };
+    }
+    if (dbEntry && (dbEntry.status === 'CASCADE_RUN_STATUS_RUNNING' || dbEntry.notFullyIdle)) {
+      return {
+        state: 'running',
+        activity: 'thinking',
+        detail: '思考中…',
+      };
+    }
+    if (parsedTranscript.mtimeMs && now - parsedTranscript.mtimeMs < 25_000) {
+      const lastItem = parsedTranscript.items[parsedTranscript.items.length - 1];
+      if (lastItem && (lastItem.role === 'user' || (lastItem.role === 'assistant' && !lastItem.content))) {
+        return {
+          state: 'running',
+          activity: 'thinking',
+          detail: '思考中…',
+        };
+      }
+    }
+    const lastItem = parsedTranscript.items[parsedTranscript.items.length - 1];
+    if (lastItem?.role === 'error') {
+      return { state: 'error', activity: 'error', detail: '执行出错' };
+    }
+    return { state: 'idle', activity: 'idle', detail: '' };
+  }
+
+  resolveTitle({ convId, parsed, dbEntry, savedMeta, meta }) {
+    const autoTitle = parsed.firstUserText
+      ? parsed.firstUserText.replace(/\s+/g, ' ').slice(0, 48)
+      : `会话 ${convId.slice(0, 8)}`;
+
+    if (
+      savedMeta?.renamedOnMobile &&
+      savedMeta?.title &&
+      (savedMeta.titleUpdatedAtMs || 0) > (dbEntry?.modifiedMs || 0)
+    ) {
+      return savedMeta.title;
+    }
+    if (dbEntry?.title) {
+      return dbEntry.title;
+    }
+    return savedMeta?.title || meta?.subagentSpec?.role || autoTitle;
+  }
+
+  resolveModelAndMode(convId, parsed) {
+    const savedMeta = this.metaStore ? this.metaStore.getConversationMeta(convId) : null;
+    const hook = this.liveHooks.get(convId);
+    const hookInfo = lookupModelInfo(hook?.modelName);
+    const transcriptInfo = lookupModelInfo(parsed.detectedModelRaw);
+    const detectedInfo = hookInfo || transcriptInfo;
+    // Always prioritize Desktop's real running model over stale local preferences;
+    // fall back to savedMeta.desiredModel ONLY when a newly created session has not yet emitted a model change.
+    const fallbackCreatedInfo = lookupModelInfo(savedMeta?.desiredModel);
+    const effective = detectedInfo || fallbackCreatedInfo;
+    return {
+      detectedModelId: detectedInfo?.id || null,
+      currentModelId: effective?.id || null,
+      currentModelDisplay: effective?.displayName || null,
+      currentModelShort: effective?.shortLabel || null,
+      sessionMode: savedMeta?.sessionMode || parsed.detectedMode || 'agent',
+    };
+  }
+
+  async scanAll({ includeMetadata = true } = {}) {
+    const appDataDirs = this.discoverAppDataDirs();
+    const rawConvs = [];
+
+    for (const appData of appDataDirs) {
+      const surface = basename(appData) === 'antigravity-cli' ? 'cli' : 'desktop';
+      const dbIndex = this.readDesktopSummariesIndex(appData);
+
+      const brainRoot = join(appData, 'brain');
+      let entries = [];
+      try {
+        entries = readdirSync(brainRoot, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+
+      for (const entry of entries) {
+        if (!entry.isDirectory() || !SAFE_CONV_RE.test(entry.name)) continue;
+        const convId = entry.name;
+        const dbEntry = dbIndex.get(convId) || null;
+        if (dbEntry?.killed) continue;
+
+        const convDir = join(brainRoot, convId);
+        let dirStat;
+        try {
+          dirStat = statSync(convDir);
+        } catch {
+          continue;
+        }
+        const parsed = this.parseTranscript(convDir);
+        const artifacts = this.listArtifacts(convDir);
+        rawConvs.push({
+          id: convId,
+          appData,
+          surface,
+          convDir,
+          dirMtimeMs: dirStat.mtimeMs,
+          dbEntry,
+          parsed,
+          artifacts,
+        });
+      }
+    }
+
+    rawConvs.sort((a, b) => {
+      const ta = a.parsed.mtimeMs || a.dirMtimeMs;
+      const tb = b.parsed.mtimeMs || b.dirMtimeMs;
+      return tb - ta;
+    });
+
+    if (includeMetadata && this.agentController) {
+      // `conversation_summaries.db` already supplies title/workspace/parent/depth in <1ms;
+      // only fall back to `agentapi get-conversation-metadata` for conversations missing from the DB index.
+      const needsMeta = rawConvs
+        .filter((c) => c.surface === 'desktop' && UUID_RE.test(c.id) && !c.dbEntry)
+        .slice(0, 6);
+      if (needsMeta.length > 0) {
+        await Promise.all(needsMeta.map((c) => this.resolveMetadata(c.id)));
+      }
+    }
+
+    const byId = new Map();
+    for (const c of rawConvs) {
+      const meta = this.metadataCache.get(c.id)?.meta || null;
+      const savedMeta = this.metaStore ? this.metaStore.getConversationMeta(c.id) : null;
+      const hook = this.liveHooks.get(c.id);
+      const dbEntry = c.dbEntry;
+
+      let workspacePath = '';
+      if (dbEntry?.workspaceUri) {
+        workspacePath = uriToPath(dbEntry.workspaceUri);
+      } else if (meta?.workspaceUris?.length) {
+        workspacePath = uriToPath(meta.workspaceUris[0]);
+      } else if (meta?.workspaces?.length) {
+        const ws0 = meta.workspaces[0];
+        workspacePath = uriToPath(typeof ws0 === 'string' ? ws0 : ws0?.workspaceFolderAbsoluteUri || ws0?.uri || '');
+      } else if (hook?.workspacePaths?.length) {
+        workspacePath = uriToPath(hook.workspacePaths[0]);
+      } else if (savedMeta?.workspacePath) {
+        workspacePath = savedMeta.workspacePath;
+      } else if (c.parsed.inferredWorkspace) {
+        workspacePath = c.parsed.inferredWorkspace;
+      }
+
+      const parentId =
+        dbEntry?.parentConversationId ||
+        meta?.parentConversationId ||
+        savedMeta?.parentConversationId ||
+        '';
+      const isSubagent = Boolean(
+        parentId ||
+          (dbEntry?.nestingDepth && dbEntry.nestingDepth > 0) ||
+          (meta?.nestingDepth && meta.nestingDepth > 0) ||
+          meta?.subagentSpec
+      );
+
+      const title = this.resolveTitle({
+        convId: c.id,
+        parsed: c.parsed,
+        dbEntry,
+        savedMeta,
+        meta,
+      });
+
+      const updatedMs = c.parsed.mtimeMs || c.dirMtimeMs;
+      const updatedAt = c.parsed.lastTimestamp || new Date(updatedMs).toISOString();
+      const pendingInteraction = this.resolvePendingInteraction(c.id, c.parsed, c.convDir);
+      const runStatus = this.computeRunState(c.id, c.parsed, dbEntry, pendingInteraction);
+      const modelAndMode = this.resolveModelAndMode(c.id, c.parsed);
+      const pinned = Boolean(dbEntry?.pinned);
+      const desktopViewedMs = dbEntry?.lastUserViewMs || 0;
+      const iosViewedMs = savedMeta?.iosViewedMs || 0;
+      const lastViewedMs = Math.max(desktopViewedMs, iosViewedMs);
+      const lastReplyMs = c.parsed.lastAssistantReplyMs || 0;
+      let hasUnread = false;
+      if (runStatus.state !== 'running') {
+        if (pendingInteraction) {
+          hasUnread = true;
+        } else if (lastReplyMs > 0) {
+          if (lastViewedMs > 0) {
+            hasUnread = lastReplyMs > lastViewedMs + 1500;
+          } else {
+            hasUnread = Date.now() - lastReplyMs < 6 * 3600 * 1000;
+          }
+        }
+      }
+
+      byId.set(c.id, {
+        id: c.id,
+        title,
+        pinned,
+        hasUnread,
+        lastReplyMs,
+        surface: c.surface,
+        workspacePath: workspacePath || null,
+        workspaceName: workspacePath ? basename(workspacePath) : '通用对话',
+        parentConversationId: parentId || null,
+        isSubagent,
+        subagentRole: meta?.subagentSpec?.role || null,
+        lastPreview: c.parsed.lastPreview || '暂无消息',
+        stepCount: c.parsed.stepCount,
+        messageCount: c.parsed.items.length,
+        artifactCount: c.artifacts.length,
+        artifacts: c.artifacts,
+        runState: runStatus.state,
+        activityDetail: runStatus.detail,
+        currentModelId: modelAndMode.currentModelId,
+        currentModelDisplay: modelAndMode.currentModelDisplay,
+        currentModelShort: modelAndMode.currentModelShort,
+        sessionMode: modelAndMode.sessionMode,
+        pendingInteraction,
+        updatedAt,
+        updatedMs,
+        convDir: c.convDir,
+        subagents: [],
+      });
+    }
+
+    const rootConversations = [];
+    for (const conv of byId.values()) {
+      if (conv.isSubagent && conv.parentConversationId && byId.has(conv.parentConversationId)) {
+        const parent = byId.get(conv.parentConversationId);
+        parent.subagents.push({
+          id: conv.id,
+          title: conv.title,
+          role: conv.subagentRole || conv.title,
+          lastPreview: conv.lastPreview,
+          runState: conv.runState,
+          activityDetail: conv.activityDetail,
+          stepCount: conv.stepCount,
+          updatedAt: conv.updatedAt,
+        });
+      } else if (!conv.isSubagent) {
+        rootConversations.push(conv);
+      }
+    }
+
+    const nextSubagentsByParent = new Map();
+    for (const conv of rootConversations) {
+      conv.subagents.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      if (conv.subagents.length > 0) {
+        nextSubagentsByParent.set(conv.id, conv.subagents);
+      }
+    }
+    this.subagentsByParent = nextSubagentsByParent;
+
+    const workspaceMap = new Map();
+    const ensureWorkspace = (wsPath, wsName, isGlobal = false) => {
+      const key = isGlobal ? '__global__' : wsPath;
+      if (!workspaceMap.has(key)) {
+        workspaceMap.set(key, {
+          id: key,
+          name: wsName,
+          path: isGlobal ? null : wsPath,
+          isGlobal,
+          conversations: [],
+          activeCount: 0,
+          latestUpdatedMs: 0,
+        });
+      }
+      return workspaceMap.get(key);
+    };
+
+    let unreadCount = 0;
+    for (const conv of rootConversations) {
+      const savedMeta = this.metaStore ? this.metaStore.getConversationMeta(conv.id) : null;
+      if (conv.messageCount === 0 && !savedMeta) continue;
+      if (conv.hasUnread) unreadCount++;
+
+      const isGlobal = !conv.workspacePath;
+      const group = ensureWorkspace(conv.workspacePath, conv.workspaceName, isGlobal);
+      const { convDir, ...publicSummary } = conv;
+      group.conversations.push(publicSummary);
+      if (conv.runState === 'running') group.activeCount++;
+      if (conv.updatedMs > group.latestUpdatedMs) group.latestUpdatedMs = conv.updatedMs;
+    }
+
+    const workspaces = [...workspaceMap.values()].sort((a, b) => {
+      if (a.activeCount !== b.activeCount) return b.activeCount - a.activeCount;
+      return b.latestUpdatedMs - a.latestUpdatedMs;
+    });
+
+    for (const ws of workspaces) {
+      ws.conversations.sort((a, b) => {
+        if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
+        return b.updatedMs - a.updatedMs;
+      });
+    }
+
+    return {
+      workspaces,
+      knownProjects: this.listKnownProjectFolders(),
+      totalConversations: rootConversations.length,
+      unreadCount,
+    };
+  }
+
+  async getConversationDetail(convId) {
+    if (!SAFE_CONV_RE.test(convId)) return null;
+    for (const appData of this.discoverAppDataDirs()) {
+      const convDir = join(appData, 'brain', convId);
+      if (!existsSync(convDir)) continue;
+      const dbIndex = this.readDesktopSummariesIndex(appData);
+      const dbEntry = dbIndex.get(convId) || null;
+      const parsed = this.parseTranscript(convDir);
+      const artifacts = this.listArtifacts(convDir);
+      const meta = dbEntry ? (this.metadataCache.get(convId)?.meta || null) : await this.resolveMetadata(convId);
+      const savedMeta = this.metaStore ? this.metaStore.getConversationMeta(convId) : null;
+      const pendingInteraction = this.resolvePendingInteraction(convId, parsed, convDir);
+      const runStatus = this.computeRunState(convId, parsed, dbEntry, pendingInteraction);
+      const modelAndMode = this.resolveModelAndMode(convId, parsed);
+
+      let workspacePath = '';
+      if (dbEntry?.workspaceUri) {
+        workspacePath = uriToPath(dbEntry.workspaceUri);
+      } else if (meta?.workspaceUris?.length) {
+        workspacePath = uriToPath(meta.workspaceUris[0]);
+      } else if (savedMeta?.workspacePath) {
+        workspacePath = savedMeta.workspacePath;
+      } else if (parsed.inferredWorkspace) {
+        workspacePath = parsed.inferredWorkspace;
+      }
+
+      const title = this.resolveTitle({
+        convId,
+        parsed,
+        dbEntry,
+        savedMeta,
+        meta,
+      });
+
+      let subagents = this.subagentsByParent.get(convId) || [];
+      if (subagents.length === 0 && this.subagentsByParent.size === 0) {
+        const allScan = await this.scanAll({ includeMetadata: false });
+        for (const ws of allScan.workspaces) {
+          const match = ws.conversations.find((c) => c.id === convId);
+          if (match) {
+            subagents = match.subagents || [];
+            break;
+          }
+        }
+      }
+
+      const attMap = this.metaStore ? this.metaStore.getMessageAttachmentsMap(convId) : {};
+      const items = parsed.items.map((it) => {
+        const savedAtts = attMap[it.id];
+        if (Array.isArray(savedAtts) && savedAtts.length > 0) {
+          return { ...it, attachments: savedAtts };
+        }
+        // For new-conversation initial user step (`step-0`), bind `ios-init-*` attachments if present
+        if (it.stepIndex === 0 && it.role === 'user' && (!it.attachments || it.attachments.length === 0)) {
+          const initKey = Object.keys(attMap).find((k) => k.startsWith('ios-init-'));
+          if (initKey && Array.isArray(attMap[initKey])) {
+            return { ...it, attachments: attMap[initKey] };
+          }
+        }
+        return it;
+      });
+      const pending = this.metaStore ? this.metaStore.getPendingMessages(convId) : [];
+      for (const p of pending) {
+        const alreadyInTranscript = items.some(
+          (it) =>
+            it.id === p.clientMessageId ||
+            (it.role === 'user' &&
+              (it.content === p.text || it.content.startsWith(p.text)) &&
+              Date.parse(it.createdAt || 0) >= p.sentAt - 15_000)
+        );
+        if (!alreadyInTranscript) {
+          items.push({
+            id: p.clientMessageId,
+            stepIndex: 999999,
+            role: 'user',
+            origin: 'ios',
+            content: p.text,
+            thinking: null,
+            toolCalls: [],
+            attachments: p.attachments || attMap[p.clientMessageId] || [],
+            createdAt: new Date(p.sentAt).toISOString(),
+            pending: false,
+          });
+        } else if (this.metaStore) {
+          this.metaStore.clearPendingMessage(convId, p.clientMessageId);
+        }
+      }
+
+      let isSubagentInMap = false;
+      for (const list of this.subagentsByParent.values()) {
+        if (list.some((s) => s.id === convId)) {
+          isSubagentInMap = true;
+          break;
+        }
+      }
+      const parentConversationId =
+        dbEntry?.parentConversationId || meta?.parentConversationId || null;
+      const isSubagent = Boolean(
+        parentConversationId || (dbEntry?.nestingDepth || 0) > 0 || isSubagentInMap
+      );
+
+      return {
+        id: convId,
+        title,
+        pinned: Boolean(dbEntry?.pinned),
+        parentConversationId,
+        isSubagent,
+        surface: basename(appData) === 'antigravity-cli' ? 'cli' : 'desktop',
+        workspacePath: workspacePath || null,
+        workspaceName: workspacePath ? basename(workspacePath) : '通用对话',
+        runState: runStatus.state,
+        activityDetail: runStatus.detail,
+        detectedModelId: modelAndMode.detectedModelId,
+        currentModelId: modelAndMode.currentModelId,
+        currentModelDisplay: modelAndMode.currentModelDisplay,
+        currentModelShort: modelAndMode.currentModelShort,
+        sessionMode: modelAndMode.sessionMode,
+        pendingInteraction,
+        items,
+        subagents,
+        artifacts,
+        convDir,
+      };
+    }
+    return null;
+  }
+
+  resolveUploadedFilePath(convId, fileName) {
+    if (!SAFE_CONV_RE.test(convId)) return null;
+    const cleanName = basename(String(fileName || '').trim());
+    if (!cleanName || cleanName.startsWith('.')) return null;
+
+    for (const appData of this.discoverAppDataDirs()) {
+      const convDir = resolvePath(join(appData, 'brain', convId));
+      const candidateDirs = [
+        resolvePath(join(convDir, '.user_uploaded')),
+        resolvePath(join(convDir, 'uploads')),
+        convDir,
+        resolvePath(join(convDir, 'scratch')),
+      ];
+      for (const dir of candidateDirs) {
+        const candidate = resolvePath(join(dir, cleanName));
+        if (candidate.startsWith(dir + sep) && existsSync(candidate)) {
+          try {
+            if (statSync(candidate).isFile()) return candidate;
+          } catch {
+            // Ignore unreadable file
+          }
+        }
+      }
+    }
+    return null;
+  }
+}

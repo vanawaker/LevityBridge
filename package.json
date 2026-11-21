@@ -1,0 +1,16 @@
+{
+  "name": "levity-bridge",
+  "version": "1.0.0",
+  "description": "Open-source companion desktop bridge plugin for Levity (iPhone, iPad & iPhone Duo)",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "install-plugin": "node scripts/install-plugin.mjs",
+    "start": "node BridgeServer/src/standalone.mjs",
+    "test": "node --test BridgeServer/tests/bridge.test.mjs"
+  }
+}

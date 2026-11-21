@@ -1,0 +1,15 @@
+{
+  "name": "antigravityz-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Official Antigravity 2.0 Sidecar & Native iOS Bridge for AntigravityZ",
+  "scripts": {
+    "start": "node src/standalone.mjs",
+    "sidecar": "node src/sidecar-entry.mjs",
+    "test": "node --test tests/bridge.test.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
