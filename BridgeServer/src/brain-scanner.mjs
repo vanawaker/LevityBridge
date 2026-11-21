@@ -205,6 +205,36 @@ function extractMobilePrompt(raw) {
   };
 }
 
+function extractBalancedJsonObject(str, fromIndex = 0) {
+  if (!str || typeof str !== 'string') return null;
+  const start = str.indexOf('{', Math.max(0, fromIndex));
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  const limit = Math.min(str.length, start + 32768);
+  for (let i = start; i < limit; i += 1) {
+    const ch = str[i];
+    if (inString) {
+      if (escape) escape = false;
+      else if (ch === '\\') escape = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return str.slice(start, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
 function parseAskQuestionArgs(args) {
   if (!args) return null;
   let questions = args.questions;
@@ -469,7 +499,7 @@ export class BrainScanner {
     if (!convId || !SAFE_CONV_RE.test(convId)) return null;
     const hookName = String(payload.hookEventName || '');
     const toolCall = payload?.toolCall || null;
-    const toolName = toolCall?.name || null;
+    const toolName = toolCall?.name || payload?.toolName || payload?.tool_name || null;
     const prev = this.liveHooks.get(convId) || {};
     const workspacePaths = Array.isArray(payload.workspacePaths) && payload.workspacePaths.length > 0
       ? payload.workspacePaths
@@ -486,7 +516,7 @@ export class BrainScanner {
       activity = 'thinking';
       detail = '思考中…';
     } else if (hookName === 'PreToolUse') {
-      const args = toolCall?.args || {};
+      const args = toolCall?.args || toolCall?.arguments || payload?.toolInput || payload?.tool_input || {};
       const clean = (v) => String(v ?? '').replace(/^"|"$/g, '');
       const bypass = args.BypassSandbox === true || clean(args.BypassSandbox) === 'true';
       const summary = summarizeToolArgs(toolName || 'tool', args);
@@ -936,12 +966,17 @@ export class BrainScanner {
         const toolMatch = /call_[0-9A-Za-z_]+[\x00-\x1f]+([a-z][a-z0-9_]{1,40})[\x00-\x1f]+/.exec(rawLatin);
         if (toolMatch?.[1] && !toolName) {
           toolName = toolMatch[1];
+        } else if (!toolName && rawUtf8.includes('ask_question')) {
+          toolName = 'ask_question';
         }
 
-        const jsonMatch = /(\{"[A-Za-z0-9_]+"[\s\S]{2,2000}?\})/.exec(rawUtf8);
-        if (jsonMatch?.[1]) {
+        const searchFrom = toolName ? Math.max(0, rawUtf8.indexOf(toolName)) : 0;
+        const jsonCandidate =
+          extractBalancedJsonObject(rawUtf8, searchFrom) ||
+          extractBalancedJsonObject(rawUtf8, 0);
+        if (jsonCandidate) {
           try {
-            parsedArgs = JSON.parse(jsonMatch[1]);
+            parsedArgs = JSON.parse(jsonCandidate);
             if (typeof parsedArgs.toolSummary === 'string' && parsedArgs.toolSummary.trim()) {
               toolSummary = parsedArgs.toolSummary.trim();
             }
@@ -1010,10 +1045,15 @@ export class BrainScanner {
    *   submits their decision), while `step_payload` already holds the tool args & safety review reason.
    */
   readAuthoritativePermissionWait(convId, convDir, inFlight = null) {
-    if (!convDir) return null;
+    const state = this.readAuthoritativeStepsState(convId, convDir, inFlight);
+    return state.waiting;
+  }
+
+  readAuthoritativeStepsState(convId, convDir, inFlight = null) {
+    if (!convDir) return { hasDb: false, waiting: null };
     const appDataDir = resolvePath(convDir, '..', '..');
     const dbPath = join(appDataDir, 'conversations', `${convId}.db`);
-    if (!existsSync(dbPath)) return null;
+    if (!existsSync(dbPath)) return { hasDb: false, waiting: null };
 
     try {
       const now = Date.now();
@@ -1022,13 +1062,14 @@ export class BrainScanner {
       const walStat = existsSync(walPath) ? statSync(walPath) : null;
       const cacheKey = `${dbStat.mtimeMs}:${dbStat.size}:${walStat?.mtimeMs || 0}:${walStat?.size || 0}`;
       const cached = this.convStepsDbCache.get(dbPath);
-      if (cached && cached.key === cacheKey && now - cached.checkedAt < 900) {
-        return cached.waiting;
+      if (cached && cached.key === cacheKey && now - cached.checkedAt < 450) {
+        return { hasDb: true, waiting: cached.waiting };
       }
 
       let waiting = null;
       const db = new DatabaseSync(dbPath, { readOnly: true });
       try {
+        // 1. Authoritative WAITING (status = 9): permission prompt or waiting question
         let row = null;
         try {
           row = db
@@ -1055,13 +1096,43 @@ export class BrainScanner {
           const matchingInFlight = inFlight && inFlight.stepIdx === row.idx ? inFlight : null;
           waiting = this.#extractWaitingStepDetails(row, matchingInFlight);
         }
+
+        // 2. Active ask_question steps live in status = 1 (PENDING) or 2 (RUNNING) while
+        // waiting for the user to select an answer in the Antigravity UI! Detect immediately
+        // BEFORE the user submits, instead of waiting for post-submit transcript flush.
+        if (!waiting) {
+          let activeRows = [];
+          try {
+            activeRows = db
+              .prepare(
+                `SELECT idx, status, permissions, step_payload
+                 FROM steps
+                 WHERE status IN (1, 2)
+                 ORDER BY idx DESC
+                 LIMIT 4`
+              )
+              .all();
+          } catch {
+            activeRows = [];
+          }
+          for (const activeRow of activeRows) {
+            if (!activeRow?.step_payload) continue;
+            const payloadBuf = Buffer.from(activeRow.step_payload);
+            if (!payloadBuf.includes('ask_question')) continue;
+            const candidate = this.#extractWaitingStepDetails(activeRow, inFlight);
+            if (candidate && candidate.kind === 'question') {
+              waiting = candidate;
+              break;
+            }
+          }
+        }
       } finally {
         db.close();
       }
       this.convStepsDbCache.set(dbPath, { key: cacheKey, checkedAt: now, waiting });
-      return waiting;
+      return { hasDb: true, waiting };
     } catch {
-      return null;
+      return { hasDb: false, waiting: null };
     }
   }
 
@@ -1087,9 +1158,15 @@ export class BrainScanner {
       }
     }
 
-    const authPermissionWait = this.readAuthoritativePermissionWait(convId, convDir, inFlight);
-    if (authPermissionWait) {
-      return authPermissionWait;
+    const dbState = this.readAuthoritativeStepsState(convId, convDir, inFlight);
+    if (dbState.waiting) {
+      return dbState.waiting;
+    }
+    // When the live SQLite steps DB exists and reports NO active waiting/ask_question step,
+    // trust SQLite as authoritative so a brief post-submit transcript flush lag NEVER fires
+    // a stale ghost notification after the user already answered!
+    if (dbState.hasDb) {
+      return null;
     }
 
     if (parsedTranscript.unansweredQuestion) {

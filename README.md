@@ -1,28 +1,44 @@
 # LevityBridge
 
-[English](./README.md) · [简体中文](./README.zh-CN.md)
+[English](./README.md) · [简体中文](./README.zh-CN.md) · [Website](https://spaceshuttle.xyz/levity/) · [Agent Runbook](./AGENT_INSTALL.md)
 
 **LevityBridge** is the open-source companion desktop plugin for **Levity** on iPhone, iPad, and iPhone Duo.
 
 > Levity & LevityBridge are independent third-party companion tools for Antigravity, not affiliated with Google.
 
-## Features
+---
 
-- **Zero External Dependencies**: Runs purely on Node.js (`>= 20`) built-in modules (`http`, `http2`, `crypto`, `zlib`, `fs`).
-- **Official Plugin Lifecycle**: Integrates cleanly via Antigravity Sidecar + Hooks (`SessionStart`, `PreInvocation`, `PreToolUse`, `PostToolUse`, `PostInvocation`, `Stop`).
-- **Local-First & Private**: Sessions, thumbnails, and uploaded files travel directly between your Mac and your iOS/iPadOS device over LAN, Tailscale, or your private network. No cloud conversation storage.
-- **Fast on Cellular**: Built-in tail pagination, HTTP Gzip compression, and cached thumbnail resizing (`sips` on macOS).
-- **Dual-Synced Unread State & Optional Push**: Syncs read receipts between desktop and mobile and supports optional stateless APNs push relay (`LEVITY_PUSH_RELAY_URL`, set `LEVITY_PUSH_RELAY_URL=off` to disable completely).
+## Easiest Install (No Coding Required — Let Your Agent Do It)
 
-## Quick Install (macOS)
+Never want to touch Terminal? Just copy the sentence below and send it directly to your **Antigravity Agent**:
+
+```text
+Please install the LevityBridge desktop plugin for me from https://github.com/vanawaker/LevityBridge following AGENT_INSTALL.md, then help me open the QR code so I can pair my phone.
+```
+
+Your Antigravity Agent will automatically check Node.js, clone the repo into `~/LevityBridge`, install the native Antigravity plugin into `~/.gemini/config/plugins/levity-bridge`, and guide you to enable **LevityBridge** and scan the QR code!
+
+> **About Antigravity's Plugin System:** Antigravity's built-in Agent Marketplace is currently Google/partner-curated, while custom user plugins install natively into `~/.gemini/config/plugins/<name>/` (with `plugin.json`, `hooks.json`, and `sidecars/bridge/sidecar.json`). `npm run install-plugin` generates those exact official plugin manifests automatically using your local Node.js path.
+
+---
+
+## Manual Terminal Install (macOS)
 
 ```bash
-git clone https://github.com/vanawaker/LevityBridge.git
-cd LevityBridge
+git clone https://github.com/vanawaker/LevityBridge.git ~/LevityBridge
+cd ~/LevityBridge
 npm run install-plugin
 ```
 
-Then restart Antigravity (or enable **LevityBridge** in Plugins Manager), open the **Levity** sidecar panel, and scan the QR code from **Levity** on your iPhone or iPad.
+Then restart Antigravity (or enable **LevityBridge** in **Customizations → Plugins**), open the **Levity** sidecar panel, and scan the QR code from **Levity** on your iPhone or iPad.
+
+## Features
+
+- **Zero External Dependencies**: Runs purely on Node.js (`>= 20`) built-in modules (`http`, `http2`, `crypto`, `zlib`, `fs`, `node:sqlite`).
+- **Official Plugin Lifecycle**: Integrates cleanly via Antigravity Sidecar + Hooks (`SessionStart`, `PreInvocation`, `PreToolUse`, `PostToolUse`, `PostInvocation`, `Stop`).
+- **Local-First & Private**: Sessions, thumbnails, and uploaded files travel directly between your Mac and your iOS/iPadOS device over LAN, Tailscale, or your private network. No cloud conversation storage.
+- **Fast on Cellular**: Built-in tail pagination, HTTP Gzip compression, and cached thumbnail resizing (`sips` on macOS).
+- **Instant Choice-Prompt & Completion Push**: Immediately alerts your phone the moment your Agent asks a choice question or finishes a turn, with dual-synced unread clearing (`LEVITY_PUSH_RELAY_URL=off` disables push relay completely).
 
 ## Configuration (Optional Environment Variables)
 

@@ -337,17 +337,17 @@ export class BridgeServer {
             });
           }
 
-          // Alert once when a conversation enters permission_waiting or ask_question
-          if (!isInitialBoot && conv.pendingInteraction) {
+          // Alert once when a main conversation enters permission_waiting or ask_question
+          if (!isInitialBoot && !conv.isSubagent && conv.pendingInteraction) {
             const key = `${conv.id}:${conv.pendingInteraction.kind}:${conv.pendingInteraction.id}`;
             if (!this.notifiedInteractions.has(key)) {
               this.notifiedInteractions.add(key);
               const subParts = [];
-              if (conv.title && conv.title !== 'Antigravity') subParts.push(conv.title);
+              if (conv.title && conv.title !== 'Antigravity' && conv.title !== 'Levity') subParts.push(conv.title);
               if (conv.pendingInteraction.title) subParts.push(conv.pendingInteraction.title);
               void this.#dispatchAlert({
                 conversationId: conv.id,
-                title: 'Antigravity',
+                title: 'Levity',
                 subtitle: subParts.join(' · '),
                 body: conv.pendingInteraction.prompt,
                 kind: 'action_required',
@@ -564,11 +564,11 @@ export class BridgeServer {
                   : (payload?.terminationReason === 'ERROR' ? '会话执行过程中遇到错误' : '本轮任务已完成');
                 const kind = payload?.terminationReason === 'ERROR' ? 'error' : 'completed';
                 const subParts = [];
-                if (detail.title && detail.title !== 'Antigravity') subParts.push(detail.title);
+                if (detail.title && detail.title !== 'Antigravity' && detail.title !== 'Levity') subParts.push(detail.title);
                 if (kind === 'error') subParts.push('执行异常');
                 await this.#dispatchAlert({
                   conversationId: convId,
-                  title: 'Antigravity',
+                  title: 'Levity',
                   subtitle: subParts.join(' · '),
                   body: bodyText,
                   kind,
@@ -675,8 +675,8 @@ export class BridgeServer {
       if (req.method === 'POST' && pathname === '/api/v1/devices/test-push') {
         const result = await this.apnsPusher.notifyConversation({
           conversationId: '',
-          title: 'Antigravity',
-          body: '官方 APNs 原生推送已连通，锁屏与后台均可实时接收会话通知。',
+          title: 'Levity',
+          body: 'APNs 远程推送已连通，锁屏与后台均可实时接收会话通知。',
           kind: 'test',
           force: true,
         });

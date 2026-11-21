@@ -19,7 +19,7 @@ fs.mkdirSync(path.join(pluginDir, 'sidecars', 'bridge'), { recursive: true });
 const pluginManifest = {
   name: 'levity-bridge',
   displayName: 'LevityBridge',
-  version: '1.0.0',
+  version: '1.0.1',
   description:
     'Open-source companion bridge plugin syncing Antigravity desktop sessions with Levity on iPhone, iPad, and iPhone Duo over LAN or Tailscale.',
   author: {

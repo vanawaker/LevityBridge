@@ -445,7 +445,7 @@ test('BridgeServer handles Desktop titles, PreInvocation userMessage injection, 
       assert.ok(pushedAlerts.length >= 1);
       const lastPush = pushedAlerts[pushedAlerts.length - 1];
       assert.equal(lastPush.payload.conversationId, rootConvId);
-      assert.equal(lastPush.payload.aps.alert.title, 'Antigravity');
+      assert.equal(lastPush.payload.aps.alert.title, 'Levity');
       assert.equal(lastPush.payload.aps.alert.subtitle, 'Demo Sync Module');
 
       // Binary attachment upload + message send + upload download
@@ -928,6 +928,115 @@ test('BridgeServer computes dual-synced hasUnread from Desktop annotations + /re
         })
       ).json();
       assert.equal(boot2.workspaces[0].conversations[0].hasUnread, false);
+    } finally {
+      await bridge.stop();
+    }
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test('BridgeServer detects status=2 SQLite ask_question immediately before answer and blocks post-submit ghost alerts', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-askq-test-'));
+  try {
+    const appData = join(sandbox, 'appdata');
+    const brainRoot = join(appData, 'brain');
+    const convsDir = join(appData, 'conversations');
+    const stateDir = join(sandbox, 'state');
+    const convId = '77777777-8888-9999-aaaa-bbbbbbbbbbbb';
+    const logDir = join(brainRoot, convId, '.system_generated', 'logs');
+    mkdirSync(logDir, { recursive: true });
+    mkdirSync(convsDir, { recursive: true });
+    mkdirSync(stateDir, { recursive: true });
+
+    writeFileSync(
+      join(logDir, 'transcript_full.jsonl'),
+      `${JSON.stringify({
+        step_index: 0,
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: new Date().toISOString(),
+        content: '帮我选方案',
+      })}\n`,
+      'utf-8'
+    );
+
+    const dbPath = join(convsDir, `${convId}.db`);
+    const db = new DatabaseSync(dbPath);
+    db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, status INTEGER, permissions BLOB, step_payload BLOB)');
+    const nestedArgs = JSON.stringify({
+      questions: [
+        {
+          is_multi_select: false,
+          question: '选哪个配色？',
+          options: ['深空星云', '液态极光'],
+        },
+      ],
+    });
+    const fakePayload = Buffer.from(`\x0a\x18call_123456789\x12\x0cask_question\x1a\x90${nestedArgs}`, 'utf8');
+    db.prepare('INSERT INTO steps (idx, status, permissions, step_payload) VALUES (?, ?, NULL, ?)').run(1, 2, fakePayload);
+    db.close();
+
+    const metaStore = new MetaStore({ stateDir });
+    const capturedPayloads = [];
+    const mockApns = new ApnsPusher({
+      metaStore,
+      sendFn: async ({ payload }) => {
+        capturedPayloads.push(payload);
+        return { sent: true, status: 200 };
+      },
+    });
+    metaStore.registerPushDevice({
+      token: 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210',
+      environment: 'production',
+      deviceId: 'ios-askq-dev',
+    });
+
+    const scanner = new BrainScanner({ appDataDirs: [appData], metaStore });
+    const bridge = new BridgeServer({
+      port: 0,
+      host: '127.0.0.1',
+      metaStore,
+      brainScanner: scanner,
+      agentController: { isAvailable: () => false },
+      apnsPusher: mockApns,
+      pollIntervalMs: 60_000,
+    });
+    await bridge.start();
+    try {
+      bridge.seq = 1;
+      await bridge.pollChanges();
+      await new Promise((r) => setTimeout(r, 80));
+
+      assert.equal(capturedPayloads.length, 1, 'Must fire action_required push IMMEDIATELY while ask_question is status=2');
+      assert.equal(capturedPayloads[0].kind, 'action_required');
+      assert.equal(capturedPayloads[0].aps.alert.body, '选哪个配色？');
+
+      const db2 = new DatabaseSync(dbPath);
+      db2.prepare('UPDATE steps SET status = 3 WHERE idx = 1').run();
+      db2.close();
+      scanner.convStepsDbCache.clear();
+      writeFileSync(
+        join(logDir, 'transcript_full.jsonl'),
+        [
+          JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: new Date().toISOString(), content: '帮我选方案' }),
+          JSON.stringify({
+            step_index: 1,
+            source: 'MODEL',
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            created_at: new Date().toISOString(),
+            content: '',
+            tool_calls: [{ id: 'call_late_lag', name: 'ask_question', args: { questions: nestedArgs } }],
+          }),
+        ].join('\n') + '\n',
+        'utf-8'
+      );
+
+      await bridge.pollChanges();
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(capturedPayloads.length, 1, 'Must NOT fire a ghost notification after SQLite marks ask_question DONE!');
     } finally {
       await bridge.stop();
     }
