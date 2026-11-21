@@ -40,6 +40,15 @@ Then restart Antigravity (or enable **LevityBridge** in **Customizations → Plu
 - **Fast on Cellular**: Built-in tail pagination, HTTP Gzip compression, and cached thumbnail resizing (`sips` on macOS).
 - **Instant Choice-Prompt & Completion Push**: Immediately alerts your phone the moment your Agent asks a choice question or finishes a turn, with dual-synced unread clearing (`LEVITY_PUSH_RELAY_URL=off` disables push relay completely).
 
+## Scope & Current Limitations
+
+**Levity** is designed as a lightweight **remote companion & monitor** for Antigravity — not a full desktop IDE replacement. Because it stays strictly within Antigravity's official public plugin & local API boundaries, a few desktop-only controls are intentionally outside scope today:
+
+- **Mid-session model switching**: You can pick any model and thinking level when creating a **new session** from Levity, and Levity displays the exact model running on your desktop. Switching models mid-conversation on an existing session is not currently exposed by Antigravity's local API, so change models on desktop when needed.
+- **Sandbox permission approval (`Always Allow`)**: High-privilege or out-of-sandbox permission prompts must be approved locally on your Mac for security. Levity sends an immediate push alert so you know when your Agent is waiting for confirmation.
+- **Mid-turn Stop / Abort**: You can send follow-up prompts, answer choice questions, and upload photos/files remotely, but forcefully cancelling an in-flight tool execution must still be done on desktop.
+- **Desktop must be awake & reachable**: Because there is no cloud mirror of your sessions, your Mac running Antigravity needs to be online and reachable over LAN or a private VPN (such as Tailscale or Surge Ponte).
+
 ## Configuration (Optional Environment Variables)
 
 | Variable | Default | Description |

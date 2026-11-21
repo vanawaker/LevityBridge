@@ -1044,3 +1044,43 @@ test('BridgeServer detects status=2 SQLite ask_question immediately before answe
     rmSync(sandbox, { recursive: true, force: true });
   }
 });
+
+test('BrainScanner deduplicates USER_INPUT and SYSTEM_MESSAGE even when PreInvocation strips emoji ZWJ characters', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-zwj-test-'));
+  try {
+    const appData = join(sandbox, 'appdata');
+    const convId = '88888888-9999-aaaa-bbbb-cccccccccccc';
+    const logDir = join(appData, 'brain', convId, '.system_generated', 'logs');
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(
+      join(logDir, 'transcript_full.jsonl'),
+      [
+        JSON.stringify({
+          step_index: 10,
+          source: 'SYSTEM_SDK',
+          type: 'USER_INPUT',
+          status: 'DONE',
+          created_at: '2026-11-21T11:21:46Z',
+          content: '<USER_REQUEST>\nStill tweaking🤦♂️ one sec\n</USER_REQUEST>',
+        }),
+        JSON.stringify({
+          step_index: 12,
+          source: 'SYSTEM',
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          created_at: '2026-11-21T11:21:46Z',
+          content:
+            '[AntigravityZ_USER_PROMPT id=ios-zwj-001]\n<USER_PROMPT>\nStill tweaking🤦\u200d♂️ one sec\n</USER_PROMPT>',
+        }),
+      ].join('\n') + '\n',
+      'utf-8'
+    );
+    const scanner = new BrainScanner({ appDataDirs: [appData] });
+    const detail = await scanner.getConversationDetail(convId);
+    const userItems = detail.items.filter((i) => i.role === 'user');
+    assert.equal(userItems.length, 1, 'ZWJ-stripped USER_INPUT and original SYSTEM_MESSAGE must merge into 1 bubble');
+    assert.equal(userItems[0].id, 'ios-zwj-001');
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});

@@ -205,6 +205,22 @@ function extractMobilePrompt(raw) {
   };
 }
 
+function normalizeUserDedupText(str) {
+  return String(str || '')
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFE00-\uFE0F\uFEFF]/g, '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isSameUserTurnText(a, b) {
+  const na = normalizeUserDedupText(a);
+  const nb = normalizeUserDedupText(b);
+  if (!na || !nb) return false;
+  return na === nb || na.startsWith(nb) || nb.startsWith(na);
+}
+
 function extractBalancedJsonObject(str, fromIndex = 0) {
   if (!str || typeof str !== 'string') return null;
   const start = str.indexOf('{', Math.max(0, fromIndex));
@@ -699,7 +715,7 @@ export class BrainScanner {
           prevItem &&
           prevItem.role === 'user' &&
           prevItem.origin === 'ios' &&
-          (prevItem.content === text || text.startsWith(prevItem.content))
+          isSameUserTurnText(prevItem.content, text)
         ) {
           prevItem.stepIndex = stepIdx;
           prevItem.createdAt = createdAt || prevItem.createdAt;
@@ -734,7 +750,7 @@ export class BrainScanner {
           if (
             prevItem &&
             prevItem.role === 'user' &&
-            (prevItem.content === mobile.text || prevItem.content.startsWith(mobile.text))
+            isSameUserTurnText(prevItem.content, mobile.text)
           ) {
             if (mobile.clientMessageId) {
               prevItem.id = mobile.clientMessageId;
