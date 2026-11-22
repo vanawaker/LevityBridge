@@ -1579,6 +1579,7 @@ export class BrainScanner {
       const modelAndMode = this.resolveModelAndMode(c.id, c.parsed);
       const pinned = Boolean(dbEntry?.pinned);
       const archived = Boolean(dbEntry?.archived);
+      const flagged = Boolean(savedMeta?.flagged);
       const desktopViewedMs = dbEntry?.lastUserViewMs || 0;
       const iosViewedMs = savedMeta?.iosViewedMs || 0;
       const lastViewedMs = Math.max(desktopViewedMs, iosViewedMs);
@@ -1601,6 +1602,7 @@ export class BrainScanner {
         title,
         pinned,
         archived,
+        flagged,
         hasUnread,
         lastReplyMs,
         surface: c.surface,

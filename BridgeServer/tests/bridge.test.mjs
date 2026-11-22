@@ -1313,3 +1313,95 @@ test('BridgeServer syncs Desktop annotations/*.pbtxt renames immediately and ret
     rmSync(sandbox, { recursive: true, force: true });
   }
 });
+
+test('BridgeServer persists conversation to-do flag and broadcasts workspaces_updated for cross-device sync', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-flag-sync-'));
+  try {
+    const appData = join(sandbox, 'appData');
+    const stateDir = join(sandbox, 'state');
+    const convId = 'flag-sync-conv-0001';
+    const convDir = join(appData, 'brain', convId);
+    const logsDir = join(convDir, '.system_generated', 'logs');
+    mkdirSync(logsDir, { recursive: true });
+    writeFileSync(
+      join(logsDir, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 1,
+        type: 'USER_INPUT',
+        created_at: '2026-11-22T10:00:00Z',
+        content: 'Follow up later on deployment checklist',
+      }) + '\n',
+      'utf-8'
+    );
+
+    const metaStore = new MetaStore({ stateDir });
+    const scanner = new BrainScanner({ appDataDirs: [appData], metaStore });
+    const bridge = new BridgeServer({
+      port: 0,
+      host: '127.0.0.1',
+      metaStore,
+      brainScanner: scanner,
+      agentController: new AgentController({ agentApiPath: 'mock-agentapi', execFn: async () => ({ stdout: '{}' }) }),
+      pollIntervalMs: 60_000,
+    });
+    await bridge.start();
+    try {
+      const port = bridge.getBoundPort();
+      const token = metaStore.getToken();
+      await bridge.pollChanges();
+
+      // Initially unflagged
+      const res0 = await fetch(`http://127.0.0.1:${port}/api/v1/bootstrap`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      assert.equal(res0.status, 200);
+      const data0 = await res0.json();
+      const conv0 = data0.workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
+      assert.ok(conv0, 'Conversation must appear in /api/v1/bootstrap');
+      assert.equal(conv0.flagged, false);
+
+      // Flag it via POST /api/v1/conversations/:id/flag
+      bridge.ringBuffer.length = 0;
+      const flagRes = await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${convId}/flag`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ flagged: true }),
+      });
+      assert.equal(flagRes.status, 200);
+      const flagJson = await flagRes.json();
+      assert.equal(flagJson.ok, true);
+      assert.equal(flagJson.flagged, true);
+
+      const wsFlagEv = bridge.ringBuffer.find((e) => e.type === 'workspaces_updated');
+      assert.ok(wsFlagEv, 'Flagging must broadcast workspaces_updated to other paired devices');
+      const flaggedConv = wsFlagEv.workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
+      assert.equal(flaggedConv?.flagged, true);
+
+      // Unflag it
+      bridge.ringBuffer.length = 0;
+      const unflagRes = await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${convId}/flag`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ flagged: false }),
+      });
+      assert.equal(unflagRes.status, 200);
+      const unflagJson = await unflagRes.json();
+      assert.equal(unflagJson.flagged, false);
+
+      const wsUnflagEv = bridge.ringBuffer.find((e) => e.type === 'workspaces_updated');
+      assert.ok(wsUnflagEv, 'Unflagging must broadcast workspaces_updated');
+      const unflaggedConv = wsUnflagEv.workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
+      assert.equal(unflaggedConv?.flagged, false);
+    } finally {
+      await bridge.stop();
+    }
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});

@@ -137,6 +137,7 @@ function fingerprintSummary(conv) {
     conv.activityDetail,
     conv.title,
     conv.pinned ? '1' : '0',
+    conv.flagged ? '1' : '0',
     conv.hasUnread ? '1' : '0',
     conv.currentModelId || '',
     conv.sessionMode || 'agent',
@@ -372,7 +373,7 @@ export class BridgeServer {
 
       const archivedList = scan.archivedConversations || [];
       const archivedFp = archivedList
-        .map((c) => `${c.id}:${c.title}:${c.updatedMs}:${c.lastPreview}`)
+        .map((c) => `${c.id}:${c.title}:${c.updatedMs}:${c.lastPreview}:${c.flagged ? '1' : '0'}`)
         .join('|');
       if (this.lastArchivedFingerprint !== null && this.lastArchivedFingerprint !== archivedFp) {
         listChanged = true;
@@ -842,6 +843,22 @@ export class BridgeServer {
           conversationId: convId,
           viewedMs,
           unreadCount: this.lastUnreadCount,
+        }, req);
+        return;
+      }
+
+      // Toggle conversation to-do flag (synced across paired mobile devices): POST /api/v1/conversations/:id/flag
+      const flagMatch = /^\/api\/v1\/conversations\/([0-9a-zA-Z_-]{6,64})\/flag$/.exec(pathname);
+      if (req.method === 'POST' && flagMatch) {
+        const convId = flagMatch[1];
+        const body = await this.#readJsonBody(req);
+        const nextFlagged = Boolean(body.flagged);
+        const meta = this.metaStore.setConversationFlagged(convId, nextFlagged);
+        await this.pollChanges();
+        this.#sendJson(res, 200, {
+          ok: true,
+          conversationId: convId,
+          flagged: Boolean(meta?.flagged),
         }, req);
         return;
       }

@@ -143,6 +143,25 @@ export class MetaStore {
     return nextMs;
   }
 
+  isConversationFlagged(convId) {
+    return Boolean(this.conversations[convId]?.flagged);
+  }
+
+  setConversationFlagged(convId, flagged) {
+    if (!convId) return null;
+    const prev = this.conversations[convId] || {};
+    const nextFlagged = Boolean(flagged);
+    const nowMs = Date.now();
+    this.conversations[convId] = {
+      ...prev,
+      flagged: nextFlagged,
+      flaggedUpdatedAtMs: nowMs,
+      updatedAt: new Date(nowMs).toISOString(),
+    };
+    this.#saveMeta();
+    return this.conversations[convId];
+  }
+
   setConversationTitle(convId, title) {
     const clean = String(title || '').trim().slice(0, 80);
     if (!clean) return null;
