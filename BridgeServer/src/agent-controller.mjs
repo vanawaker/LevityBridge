@@ -4,7 +4,7 @@
  * and new conversation / workspace initialization.
  */
 import { execFile } from 'node:child_process';
-import { accessSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
+import { accessSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import { promisify } from 'node:util';
@@ -298,6 +298,31 @@ export class AgentController {
     return set;
   }
 
+  resolveDesktopProjectIdForWorkspace(workspacePath) {
+    const cleanTarget = workspacePath ? resolvePath(String(workspacePath)) : '';
+    if (!cleanTarget) return 'outside-of-project';
+    try {
+      const projectsDir = join(homedir(), '.gemini', 'config', 'projects');
+      if (!existsSync(projectsDir)) return 'outside-of-project';
+      for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+        try {
+          const parsed = JSON.parse(readFileSync(join(projectsDir, entry.name), 'utf-8'));
+          if (!parsed?.id || parsed?.sidecar) continue;
+          const rawStr = JSON.stringify(parsed.projectResources || parsed.workspaces || {});
+          if (rawStr.includes(cleanTarget)) {
+            return String(parsed.id);
+          }
+        } catch {
+          // Ignore malformed project file
+        }
+      }
+    } catch {
+      // Ignore unreadable projects dir
+    }
+    return 'outside-of-project';
+  }
+
   async createConversation({
     prompt,
     title = '',
@@ -349,9 +374,18 @@ export class AgentController {
 
     args.push('--', fullPrompt);
 
-    const cwd = resolvedWorkspace && existsSync(resolvedWorkspace) ? resolvedWorkspace : process.cwd();
+    // Explicitly target Desktop's native `outside-of-project` (or a matching user Project ID)
+    // instead of inheriting the sidecar's auto-created hidden project (`ANTIGRAVITY_PROJECT_ID`),
+    // and never fall back to the plugin's own sidecar directory as `cwd`.
+    const targetProjectId = this.resolveDesktopProjectIdForWorkspace(resolvedWorkspace);
+    const cwd = resolvedWorkspace && existsSync(resolvedWorkspace) ? resolvedWorkspace : homedir();
+    const env = {
+      ...process.env,
+      ANTIGRAVITY_PROJECT_ID: targetProjectId,
+    };
     const { stdout, stderr } = await this.execFn(this.agentApiPath, args, {
       cwd,
+      env,
       timeout: 15_000,
       maxBuffer: 2 * 1024 * 1024,
     });

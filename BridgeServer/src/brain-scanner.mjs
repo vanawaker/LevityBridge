@@ -337,15 +337,76 @@ function uriToPath(uriOrPath) {
   return first;
 }
 
+function parsePbtxtTitle(txt) {
+  const m = /\btitle:\s*"((?:[^"\\]|\\.)*)"/.exec(String(txt || ''));
+  if (!m) return '';
+  const raw = m[1];
+  const bytes = [];
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] === '\\' && i + 1 < raw.length) {
+      const next = raw[i + 1];
+      if (next >= '0' && next <= '7') {
+        let oct = next;
+        if (i + 2 < raw.length && raw[i + 2] >= '0' && raw[i + 2] <= '7') {
+          oct += raw[i + 2];
+          if (i + 3 < raw.length && raw[i + 3] >= '0' && raw[i + 3] <= '7') {
+            oct += raw[i + 3];
+          }
+        }
+        bytes.push(parseInt(oct, 8) & 0xff);
+        i += oct.length;
+        continue;
+      }
+      if (next === 'n') { bytes.push(0x0a); i++; continue; }
+      if (next === 'r') { bytes.push(0x0d); i++; continue; }
+      if (next === 't') { bytes.push(0x09); i++; continue; }
+      if (next === '"' || next === '\\' || next === "'") {
+        bytes.push(next.charCodeAt(0));
+        i++;
+        continue;
+      }
+    }
+    const cp = raw.codePointAt(i);
+    if (cp > 0xffff) i++;
+    const chBuf = Buffer.from(String.fromCodePoint(cp), 'utf8');
+    for (const b of chBuf) bytes.push(b);
+  }
+  return Buffer.from(bytes).toString('utf8').trim();
+}
+
+function extractFirstLocalFolder(obj) {
+  if (!obj) return null;
+  if (typeof obj === 'string') {
+    const p = uriToPath(obj);
+    return p && p.startsWith('/') ? p : null;
+  }
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const found = extractFirstLocalFolder(item);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof obj === 'object') {
+    for (const val of Object.values(obj)) {
+      const found = extractFirstLocalFolder(val);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 export class BrainScanner {
   constructor({
     appDataDirs = null,
     projectsRoot = process.env.ANTIGRAVITYZ_PROJECTS_ROOT || join(homedir(), 'Projects'),
+    projectsConfigDir = null,
     agentController = null,
     metaStore = null,
   } = {}) {
     this.explicitAppDataDirs = appDataDirs;
     this.projectsRoot = projectsRoot;
+    this.projectsConfigDir = projectsConfigDir || join(homedir(), '.gemini', 'config', 'projects');
     this.agentController = agentController;
     this.metaStore = metaStore;
     this.transcriptCache = new Map();
@@ -354,8 +415,50 @@ export class BrainScanner {
     this.convStepsDbCache = new Map();
     this.subagentsByParent = new Map();
     this.annotationsCache = new Map();
+    this.desktopProjectsCache = { key: '', map: new Map() };
     this.liveHooks = new Map();
     this.inFlightTools = new Map(); // convId -> { id, name, summary, bypassSandbox, commandLine, askQuestion, startedAt }
+  }
+
+  readDesktopProjects() {
+    const dir = this.projectsConfigDir;
+    if (!dir || !existsSync(dir)) return new Map();
+    try {
+      const entries = readdirSync(dir, { withFileTypes: true }).filter(
+        (e) => e.isFile() && e.name.endsWith('.json')
+      );
+      const keyParts = [];
+      for (const e of entries) {
+        try {
+          const st = statSync(join(dir, e.name));
+          keyParts.push(`${e.name}:${st.mtimeMs}:${st.size}`);
+        } catch {
+          // Ignore transient file removal
+        }
+      }
+      const cacheKey = keyParts.sort().join('|');
+      if (this.desktopProjectsCache.key === cacheKey) {
+        return this.desktopProjectsCache.map;
+      }
+      const fresh = new Map();
+      for (const e of entries) {
+        try {
+          const parsed = JSON.parse(readFileSync(join(dir, e.name), 'utf-8'));
+          // Skip hidden/auto-managed sidecar projects (e.g. antigravity-z/bridge, swarm/swarm_board)
+          if (!parsed?.id || parsed?.sidecar) continue;
+          const id = String(parsed.id).trim();
+          const name = String(parsed.name || '').trim();
+          const folderPath = extractFirstLocalFolder(parsed.projectResources || parsed.workspaces || parsed.folders);
+          fresh.set(id, { id, name, folderPath });
+        } catch {
+          // Ignore malformed project JSON
+        }
+      }
+      this.desktopProjectsCache = { key: cacheKey, map: fresh };
+      return fresh;
+    } catch {
+      return new Map();
+    }
   }
 
   discoverAppDataDirs() {
@@ -404,18 +507,29 @@ export class BrainScanner {
           const freshMap = new Map();
           const db = new DatabaseSync(dbPath, { readOnly: true });
           try {
-            const rows = db
-              .prepare(
-                `SELECT conversation_id, title, workspace_uris, status, parent_conversation_id, nesting_depth, not_fully_idle, killed, last_modified_time
-                 FROM conversation_summaries`
-              )
-              .all();
+            let rows = [];
+            try {
+              rows = db
+                .prepare(
+                  `SELECT conversation_id, title, workspace_uris, project_id, status, parent_conversation_id, nesting_depth, not_fully_idle, killed, last_modified_time
+                   FROM conversation_summaries`
+                )
+                .all();
+            } catch {
+              rows = db
+                .prepare(
+                  `SELECT conversation_id, title, workspace_uris, status, parent_conversation_id, nesting_depth, not_fully_idle, killed, last_modified_time
+                   FROM conversation_summaries`
+                )
+                .all();
+            }
             for (const row of rows) {
               if (!row?.conversation_id) continue;
               const modifiedMs = row.last_modified_time ? Date.parse(row.last_modified_time) || 0 : 0;
               freshMap.set(row.conversation_id, {
                 title: typeof row.title === 'string' ? row.title.trim() : '',
                 workspaceUri: typeof row.workspace_uris === 'string' ? row.workspace_uris.trim() : '',
+                projectId: typeof row.project_id === 'string' ? row.project_id.trim() : '',
                 status: typeof row.status === 'string' ? row.status.trim() : '',
                 parentConversationId: typeof row.parent_conversation_id === 'string' ? row.parent_conversation_id.trim() : '',
                 nestingDepth: Number(row.nesting_depth || 0),
@@ -475,20 +589,23 @@ export class BrainScanner {
           const convId = entry.name.slice(0, -'.pbtxt'.length);
           const fPath = join(annDir, entry.name);
           const st = statSync(fPath);
+          const annCacheKey = `${st.mtimeMs}:${st.size}`;
           let ann = this.annotationsCache.get(fPath);
-          if (!ann || ann.mtimeMs !== st.mtimeMs) {
+          if (!ann || ann.cacheKey !== annCacheKey) {
             const txt = readFileSync(fPath, 'utf-8');
             const pinned = /\bpinned:\s*true\b/.test(txt);
+            const title = parsePbtxtTitle(txt);
             const viewMatch = /last_user_view_time:\s*\{\s*seconds:\s*(\d+)(?:\s+nanos:\s*(\d+))?\s*\}/.exec(txt);
             const lastUserViewMs = viewMatch
               ? Number(viewMatch[1]) * 1000 + Math.floor(Number(viewMatch[2] || 0) / 1e6)
               : 0;
-            ann = { mtimeMs: st.mtimeMs, pinned, lastUserViewMs };
+            ann = { cacheKey: annCacheKey, mtimeMs: st.mtimeMs, pinned, title, lastUserViewMs };
             this.annotationsCache.set(fPath, ann);
           }
           const existing = result.get(convId) || {
             title: '',
             workspaceUri: '',
+            projectId: '',
             status: '',
             parentConversationId: '',
             nestingDepth: 0,
@@ -499,6 +616,11 @@ export class BrainScanner {
             lastUserViewMs: 0,
           };
           existing.pinned = Boolean(ann.pinned);
+          // Desktop Antigravity updates `annotations/<id>.pbtxt` atomically upon every rename,
+          // often before `conversation_summaries.db` WAL checkpoints flush.
+          if (ann.title) {
+            existing.title = ann.title;
+          }
           existing.lastUserViewMs = Math.max(existing.lastUserViewMs || 0, ann.lastUserViewMs || 0);
           result.set(convId, existing);
         }
@@ -519,7 +641,7 @@ export class BrainScanner {
     const prev = this.liveHooks.get(convId) || {};
     const workspacePaths = Array.isArray(payload.workspacePaths) && payload.workspacePaths.length > 0
       ? payload.workspacePaths
-      : (payload.cwd ? [payload.cwd] : prev.workspacePaths || []);
+      : (prev.workspacePaths || []);
 
     let activity = prev.activity || 'idle';
     let detail = prev.detail || '';
@@ -1287,17 +1409,48 @@ export class BrainScanner {
       ? parsed.firstUserText.replace(/\s+/g, ' ').slice(0, 48)
       : `会话 ${convId.slice(0, 8)}`;
 
-    if (
-      savedMeta?.renamedOnMobile &&
-      savedMeta?.title &&
-      (savedMeta.titleUpdatedAtMs || 0) > (dbEntry?.modifiedMs || 0)
-    ) {
-      return savedMeta.title;
-    }
+    // Desktop Antigravity (`annotations/*.pbtxt` + `conversation_summaries.db`) is always
+    // the authoritative single source of truth for conversation titles.
     if (dbEntry?.title) {
       return dbEntry.title;
     }
     return savedMeta?.title || meta?.subagentSpec?.role || autoTitle;
+  }
+
+  resolveWorkspaceBinding({ dbEntry, meta, hook, savedMeta, desktopProjects }) {
+    let workspacePath = '';
+    let workspaceName = '';
+    const projectId = dbEntry?.projectId || meta?.projectId || '';
+    const realProject =
+      projectId && projectId !== 'outside-of-project'
+        ? desktopProjects?.get(projectId) || null
+        : null;
+
+    if (dbEntry?.workspaceUri) {
+      workspacePath = uriToPath(dbEntry.workspaceUri);
+      workspaceName = workspacePath ? basename(workspacePath) : '';
+    } else if (meta?.workspaceUris?.length) {
+      workspacePath = uriToPath(meta.workspaceUris[0]);
+      workspaceName = workspacePath ? basename(workspacePath) : '';
+    } else if (meta?.workspaces?.length) {
+      const ws0 = meta.workspaces[0];
+      workspacePath = uriToPath(typeof ws0 === 'string' ? ws0 : ws0?.workspaceFolderAbsoluteUri || ws0?.uri || '');
+      workspaceName = workspacePath ? basename(workspacePath) : '';
+    } else if (realProject) {
+      workspacePath = realProject.folderPath || `project://${realProject.id}`;
+      workspaceName = realProject.name || (realProject.folderPath ? basename(realProject.folderPath) : '项目');
+    } else if (hook?.workspacePaths?.length) {
+      workspacePath = uriToPath(hook.workspacePaths[0]);
+      workspaceName = workspacePath ? basename(workspacePath) : '';
+    } else if (savedMeta?.workspacePath) {
+      workspacePath = savedMeta.workspacePath;
+      workspaceName = workspacePath ? basename(workspacePath) : '';
+    }
+
+    return {
+      workspacePath: workspacePath || null,
+      workspaceName: workspacePath ? (workspaceName || basename(workspacePath)) : '通用对话',
+    };
   }
 
   resolveModelAndMode(convId, parsed) {
@@ -1380,6 +1533,7 @@ export class BrainScanner {
       }
     }
 
+    const desktopProjects = this.readDesktopProjects();
     const byId = new Map();
     for (const c of rawConvs) {
       const meta = this.metadataCache.get(c.id)?.meta || null;
@@ -1387,21 +1541,13 @@ export class BrainScanner {
       const hook = this.liveHooks.get(c.id);
       const dbEntry = c.dbEntry;
 
-      let workspacePath = '';
-      if (dbEntry?.workspaceUri) {
-        workspacePath = uriToPath(dbEntry.workspaceUri);
-      } else if (meta?.workspaceUris?.length) {
-        workspacePath = uriToPath(meta.workspaceUris[0]);
-      } else if (meta?.workspaces?.length) {
-        const ws0 = meta.workspaces[0];
-        workspacePath = uriToPath(typeof ws0 === 'string' ? ws0 : ws0?.workspaceFolderAbsoluteUri || ws0?.uri || '');
-      } else if (hook?.workspacePaths?.length) {
-        workspacePath = uriToPath(hook.workspacePaths[0]);
-      } else if (savedMeta?.workspacePath) {
-        workspacePath = savedMeta.workspacePath;
-      } else if (c.parsed.inferredWorkspace) {
-        workspacePath = c.parsed.inferredWorkspace;
-      }
+      const { workspacePath, workspaceName } = this.resolveWorkspaceBinding({
+        dbEntry,
+        meta,
+        hook,
+        savedMeta,
+        desktopProjects,
+      });
 
       const parentId =
         dbEntry?.parentConversationId ||
@@ -1454,7 +1600,7 @@ export class BrainScanner {
         lastReplyMs,
         surface: c.surface,
         workspacePath: workspacePath || null,
-        workspaceName: workspacePath ? basename(workspacePath) : '通用对话',
+        workspaceName,
         parentConversationId: parentId || null,
         isSubagent,
         subagentRole: meta?.subagentSpec?.role || null,
@@ -1571,16 +1717,15 @@ export class BrainScanner {
       const runStatus = this.computeRunState(convId, parsed, dbEntry, pendingInteraction);
       const modelAndMode = this.resolveModelAndMode(convId, parsed);
 
-      let workspacePath = '';
-      if (dbEntry?.workspaceUri) {
-        workspacePath = uriToPath(dbEntry.workspaceUri);
-      } else if (meta?.workspaceUris?.length) {
-        workspacePath = uriToPath(meta.workspaceUris[0]);
-      } else if (savedMeta?.workspacePath) {
-        workspacePath = savedMeta.workspacePath;
-      } else if (parsed.inferredWorkspace) {
-        workspacePath = parsed.inferredWorkspace;
-      }
+      const desktopProjects = this.readDesktopProjects();
+      const hook = this.liveHooks.get(convId);
+      const { workspacePath, workspaceName } = this.resolveWorkspaceBinding({
+        dbEntry,
+        meta,
+        hook,
+        savedMeta,
+        desktopProjects,
+      });
 
       const title = this.resolveTitle({
         convId,
@@ -1665,7 +1810,7 @@ export class BrainScanner {
         isSubagent,
         surface: basename(appData) === 'antigravity-cli' ? 'cli' : 'desktop',
         workspacePath: workspacePath || null,
-        workspaceName: workspacePath ? basename(workspacePath) : '通用对话',
+        workspaceName,
         runState: runStatus.state,
         activityDetail: runStatus.detail,
         detectedModelId: modelAndMode.detectedModelId,

@@ -141,6 +141,7 @@ function fingerprintSummary(conv) {
     conv.currentModelId || '',
     conv.sessionMode || 'agent',
     conv.workspacePath || '',
+    conv.workspaceName || '',
     conv.lastPreview || '',
     conv.updatedMs || 0,
     interactFp,
@@ -223,7 +224,7 @@ export class BridgeServer {
     const actualPort = this.getBoundPort();
     const net = discoverNetworkAddresses(actualPort);
     const token = this.metaStore.getToken();
-    const pairingUri = `levity://pair?url=${encodeURIComponent(net.primaryUrl)}&token=${encodeURIComponent(token)}&name=${encodeURIComponent(net.hostname)}`;
+    const pairingUri = `antigravityz://pair?url=${encodeURIComponent(net.primaryUrl)}&token=${encodeURIComponent(token)}&name=${encodeURIComponent(net.hostname)}`;
     return {
       ...net,
       token,
@@ -903,21 +904,13 @@ export class BridgeServer {
         return;
       }
 
-      // Rename conversation: POST /api/v1/conversations/:id/rename
+      // Desktop official `agentapi` does not expose a conversation rename API;
+      // never create desynchronized mobile-only fake titles.
       const renameMatch = /^\/api\/v1\/conversations\/([0-9a-zA-Z_-]{6,64})\/rename$/.exec(pathname);
       if (req.method === 'POST' && renameMatch) {
-        const convId = renameMatch[1];
-        const body = await this.#readJsonBody(req);
-        const updated = this.metaStore.setConversationTitle(convId, body.title);
-        await this.pollChanges();
-        const detail = await this.brainScanner.getConversationDetail(convId);
-        if (detail) {
-          this.emitEvent('conversation_updated', {
-            conversationId: convId,
-            detail: this.#stripPrivateDetail(detail),
-          });
-        }
-        this.#sendJson(res, 200, { ok: true, meta: updated });
+        this.#sendJson(res, 501, {
+          error: '桌面端官方插件接口暂不支持远程重命名，请在 Antigravity 桌面端修改会话标题',
+        });
         return;
       }
 

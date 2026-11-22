@@ -71,7 +71,7 @@ test('QuotaMonitor parses GetUserStatus model quota pools and reset times', () =
 });
 
 test('QR SVG generator produces valid crisp SVG for pairing URIs', () => {
-  const uri = 'levity://pair?url=http%3A%2F%2F100.64.0.1%3A19818&token=abc123XYZ_sampleToken987654&name=StudioMac';
+  const uri = 'antigravityz://pair?url=http%3A%2F%2F100.108.180.5%3A19818&token=abc123XYZ_secretToken987654&name=StudioMac';
   const svg = generateQrSvg(uri);
   assert.ok(svg.startsWith('<svg xmlns="http://www.w3.org/2000/svg"'));
   assert.ok(svg.includes('<path d="M'));
@@ -110,8 +110,8 @@ test('BridgeServer handles Desktop titles, PreInvocation userMessage injection, 
        (conversation_id, title, last_modified_time, workspace_uris, status, parent_conversation_id, nesting_depth, not_fully_idle, killed)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`
     );
-    ins.run(rootConvId, 'Demo Sync Module', '2026-11-19T01:30:00Z', '', 'CASCADE_RUN_STATUS_IDLE', '', 0, 0);
-    ins.run(subConvId, '', '2026-11-19T01:25:00Z', '', 'CASCADE_RUN_STATUS_IDLE', rootConvId, 1, 0);
+    ins.run(rootConvId, 'Demo Sync Module', '2026-11-19T01:30:00Z', `file://${join(projectsRoot, 'DemoApp')}`, 'CASCADE_RUN_STATUS_IDLE', '', 0, 0);
+    ins.run(subConvId, '', '2026-11-19T01:25:00Z', `file://${join(projectsRoot, 'DemoApp')}`, 'CASCADE_RUN_STATUS_IDLE', rootConvId, 1, 0);
     db.close();
 
     writeFileSync(
@@ -1005,6 +1005,7 @@ test('BridgeServer detects status=2 SQLite ask_question immediately before answe
     });
     await bridge.start();
     try {
+      // Advance seq past initial boot
       bridge.seq = 1;
       await bridge.pollChanges();
       await new Promise((r) => setTimeout(r, 80));
@@ -1013,6 +1014,8 @@ test('BridgeServer detects status=2 SQLite ask_question immediately before answe
       assert.equal(capturedPayloads[0].kind, 'action_required');
       assert.equal(capturedPayloads[0].aps.alert.body, '选哪个配色？');
 
+      // Now simulate user submitting answer: SQLite flips to status=3 (DONE),
+      // while transcript_full.jsonl briefly flushes PLANNER_RESPONSE before GENERIC DONE!
       const db2 = new DatabaseSync(dbPath);
       db2.prepare('UPDATE steps SET status = 3 WHERE idx = 1').run();
       db2.close();
@@ -1061,7 +1064,7 @@ test('BrainScanner deduplicates USER_INPUT and SYSTEM_MESSAGE even when PreInvoc
           type: 'USER_INPUT',
           status: 'DONE',
           created_at: '2026-11-21T11:21:46Z',
-          content: '<USER_REQUEST>\nStill tweaking🤦♂️ one sec\n</USER_REQUEST>',
+          content: '<USER_REQUEST>\n我还没改完呢🤦♂️ 再改改\n</USER_REQUEST>',
         }),
         JSON.stringify({
           step_index: 12,
@@ -1070,7 +1073,7 @@ test('BrainScanner deduplicates USER_INPUT and SYSTEM_MESSAGE even when PreInvoc
           status: 'DONE',
           created_at: '2026-11-21T11:21:46Z',
           content:
-            '[AntigravityZ_USER_PROMPT id=ios-zwj-001]\n<USER_PROMPT>\nStill tweaking🤦\u200d♂️ one sec\n</USER_PROMPT>',
+            '[AntigravityZ_USER_PROMPT id=ios-zwj-001]\n<USER_PROMPT>\n我还没改完呢🤦\u200d♂️ 再改改\n</USER_PROMPT>',
         }),
       ].join('\n') + '\n',
       'utf-8'
@@ -1080,6 +1083,216 @@ test('BrainScanner deduplicates USER_INPUT and SYSTEM_MESSAGE even when PreInvoc
     const userItems = detail.items.filter((i) => i.role === 'user');
     assert.equal(userItems.length, 1, 'ZWJ-stripped USER_INPUT and original SYSTEM_MESSAGE must merge into 1 bubble');
     assert.equal(userItems[0].id, 'ios-zwj-001');
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test('AgentController targets outside-of-project and homedir for general chats, and BrainScanner never fabricates projects from transcripts', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-proj-test-'));
+  try {
+    const appData = join(sandbox, 'antigravity');
+    const projectsRoot = join(sandbox, 'Projects');
+    const projectsCfgDir = join(sandbox, 'config', 'projects');
+    mkdirSync(join(projectsRoot, 'SecretRepo'), { recursive: true });
+    mkdirSync(projectsCfgDir, { recursive: true });
+    mkdirSync(join(appData, 'annotations'), { recursive: true });
+
+    // One real user Desktop project + one hidden sidecar project
+    const realProjId = '1111aaaa-2222-3333-4444-555566667777';
+    const sidecarProjId = '9e2ff9e9-3ee9-47b3-bb41-d4c5f7d3f003';
+    writeFileSync(
+      join(projectsCfgDir, `${realProjId}.json`),
+      JSON.stringify({
+        id: realProjId,
+        name: 'RealDesktopProj',
+        projectResources: { localFolders: [{ uri: `file://${join(projectsRoot, 'SecretRepo')}` }] },
+      }),
+      'utf-8'
+    );
+    writeFileSync(
+      join(projectsCfgDir, `${sidecarProjId}.json`),
+      JSON.stringify({
+        id: sidecarProjId,
+        name: 'antigravity-z/bridge',
+        projectResources: {},
+        sidecar: { sidecarId: 'antigravity-z/bridge' },
+      }),
+      'utf-8'
+    );
+
+    const freeConvId = 'f1111111-2222-3333-4444-555555555551';
+    const realProjConvId = 'f1111111-2222-3333-4444-555555555552';
+    const sidecarConvId = 'f1111111-2222-3333-4444-555555555553';
+
+    const db = new DatabaseSync(join(appData, 'conversation_summaries.db'));
+    db.exec(`
+      CREATE TABLE conversation_summaries (
+        conversation_id text PRIMARY KEY,
+        title text NOT NULL DEFAULT '',
+        preview text NOT NULL DEFAULT '',
+        step_count integer NOT NULL DEFAULT 0,
+        last_modified_time datetime NOT NULL,
+        workspace_uris text NOT NULL,
+        project_id text NOT NULL DEFAULT '',
+        status text NOT NULL DEFAULT '',
+        parent_conversation_id text NOT NULL DEFAULT '',
+        nesting_depth integer NOT NULL DEFAULT 0,
+        not_fully_idle numeric NOT NULL DEFAULT 0,
+        killed numeric NOT NULL DEFAULT 0
+      );
+    `);
+    const ins = db.prepare(
+      `INSERT INTO conversation_summaries
+       (conversation_id, title, last_modified_time, workspace_uris, project_id, status, parent_conversation_id, nesting_depth, not_fully_idle, killed)
+       VALUES (?, ?, ?, ?, ?, 'CASCADE_RUN_STATUS_IDLE', '', 0, 0, 0)`
+    );
+    ins.run(freeConvId, 'Free Chat Mentioning Repo', '2026-11-22T02:00:00Z', '', 'outside-of-project');
+    ins.run(realProjConvId, 'Real Project Chat', '2026-11-22T02:01:00Z', '', realProjId);
+    ins.run(sidecarConvId, 'Legacy Sidecar Chat', '2026-11-22T02:02:00Z', '', sidecarProjId);
+    db.close();
+
+    for (const [cid, txt] of [
+      [freeConvId, `帮我看下 ${join(projectsRoot, 'SecretRepo', 'main.swift')}`],
+      [realProjConvId, '检查真实项目'],
+      [sidecarConvId, 'Surge 网络排查'],
+    ]) {
+      const logDir = join(appData, 'brain', cid, '.system_generated', 'logs');
+      mkdirSync(logDir, { recursive: true });
+      writeFileSync(
+        join(logDir, 'transcript_full.jsonl'),
+        JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-22T02:00:00Z', content: txt }) + '\n',
+        'utf-8'
+      );
+    }
+
+    const capturedOpts = [];
+    const controller = new AgentController({
+      agentApiPath: 'mock-agentapi',
+      projectsRoot,
+      execFn: async (_bin, args, opts) => {
+        capturedOpts.push({ args, cwd: opts?.cwd, projectId: opts?.env?.ANTIGRAVITY_PROJECT_ID });
+        return { stdout: JSON.stringify({ conversationId: freeConvId }), stderr: '' };
+      },
+    });
+    await controller.createConversation({ prompt: '自由聊聊', workspacePath: '' });
+    assert.equal(capturedOpts[0].projectId, 'outside-of-project', 'General chat must target outside-of-project');
+    assert.notEqual(capturedOpts[0].cwd, process.cwd(), 'General chat cwd must not stay inside plugin dir');
+
+    const scanner = new BrainScanner({
+      appDataDirs: [appData],
+      projectsRoot,
+      projectsConfigDir: projectsCfgDir,
+    });
+    const scan = await scanner.scanAll({ includeMetadata: false });
+    const allConvs = scan.workspaces.flatMap((w) => w.conversations);
+    const freeSummary = allConvs.find((c) => c.id === freeConvId);
+    const realSummary = allConvs.find((c) => c.id === realProjConvId);
+    const sidecarSummary = allConvs.find((c) => c.id === sidecarConvId);
+
+    assert.equal(freeSummary.workspacePath, null, 'Free chat must NOT fabricate a project from chat transcript paths');
+    assert.equal(freeSummary.workspaceName, '通用对话');
+    assert.equal(realSummary.workspaceName, 'RealDesktopProj', 'Real Desktop project must sync 1:1');
+    assert.equal(sidecarSummary.workspacePath, null, 'Hidden sidecar project must NOT leak as a user project');
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test('BridgeServer syncs Desktop annotations/*.pbtxt renames immediately and returns 501 for mobile-only /rename', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-rename-sync-'));
+  try {
+    const appData = join(sandbox, 'antigravity');
+    const convId = 'd1111111-2222-3333-4444-555555555555';
+    mkdirSync(join(appData, 'annotations'), { recursive: true });
+    const logDir = join(appData, 'brain', convId, '.system_generated', 'logs');
+    mkdirSync(logDir, { recursive: true });
+
+    const db = new DatabaseSync(join(appData, 'conversation_summaries.db'));
+    db.exec(`
+      CREATE TABLE conversation_summaries (
+        conversation_id text PRIMARY KEY,
+        title text NOT NULL DEFAULT '',
+        preview text NOT NULL DEFAULT '',
+        step_count integer NOT NULL DEFAULT 0,
+        last_modified_time datetime NOT NULL,
+        workspace_uris text NOT NULL,
+        project_id text NOT NULL DEFAULT '',
+        status text NOT NULL DEFAULT '',
+        parent_conversation_id text NOT NULL DEFAULT '',
+        nesting_depth integer NOT NULL DEFAULT 0,
+        not_fully_idle numeric NOT NULL DEFAULT 0,
+        killed numeric NOT NULL DEFAULT 0
+      );
+    `);
+    db.prepare(
+      `INSERT INTO conversation_summaries
+       (conversation_id, title, last_modified_time, workspace_uris, project_id, status, parent_conversation_id, nesting_depth, not_fully_idle, killed)
+       VALUES (?, 'Original Desktop Title', '2026-11-22T02:00:00Z', '', 'outside-of-project', 'CASCADE_RUN_STATUS_IDLE', '', 0, 0, 0)`
+    ).run(convId);
+    db.close();
+
+    writeFileSync(
+      join(appData, 'annotations', `${convId}.pbtxt`),
+      'title:"Original Desktop Title" last_user_view_time:{seconds:1795315800}\n',
+      'utf-8'
+    );
+    writeFileSync(
+      join(logDir, 'transcript_full.jsonl'),
+      JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-22T02:00:00Z', content: '你好' }) + '\n',
+      'utf-8'
+    );
+
+    const metaStore = new MetaStore({ stateDir: join(sandbox, 'state') });
+    // Even if a legacy mobile alias exists in metaStore, Desktop title must win!
+    metaStore.setConversationTitle(convId, 'Stale Mobile Alias');
+
+    const scanner = new BrainScanner({ appDataDirs: [appData], metaStore });
+    const bridge = new BridgeServer({
+      port: 0,
+      host: '127.0.0.1',
+      metaStore,
+      brainScanner: scanner,
+      agentController: new AgentController({ agentApiPath: 'mock-agentapi', execFn: async () => ({ stdout: '{}' }) }),
+      pollIntervalMs: 60_000,
+    });
+    await bridge.start();
+    const port = bridge.getBoundPort();
+    const token = metaStore.getToken();
+
+    try {
+      // Initial baseline poll
+      await bridge.pollChanges();
+      const d1 = await scanner.getConversationDetail(convId);
+      assert.equal(d1.title, 'Original Desktop Title', 'Desktop title must always override stale mobile alias');
+
+      // Mobile /rename must honestly return 501 instead of creating a fake local-only title
+      const renameRes = await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${convId}/rename`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'Fake Mobile Name' }),
+      });
+      assert.equal(renameRes.status, 501);
+
+      // Now simulate user renaming on Desktop (updates annotations/<id>.pbtxt even before SQLite WAL!)
+      bridge.ringBuffer.length = 0;
+      await new Promise((r) => setTimeout(r, 20));
+      writeFileSync(
+        join(appData, 'annotations', `${convId}.pbtxt`),
+        'title:"桌面端新标题 🚀" last_user_view_time:{seconds:1795315900}\n',
+        'utf-8'
+      );
+
+      await bridge.pollChanges();
+      const convEv = bridge.ringBuffer.find((e) => e.type === 'conversation_updated' && e.conversationId === convId);
+      const wsEv = bridge.ringBuffer.find((e) => e.type === 'workspaces_updated');
+      assert.ok(convEv, 'Desktop rename must emit conversation_updated immediately');
+      assert.equal(convEv.detail.title, '桌面端新标题 🚀');
+      assert.ok(wsEv, 'Desktop rename must emit workspaces_updated immediately');
+      assert.equal(wsEv.workspaces[0].conversations[0].title, '桌面端新标题 🚀');
+    } finally {
+      await bridge.stop();
+    }
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
   }
