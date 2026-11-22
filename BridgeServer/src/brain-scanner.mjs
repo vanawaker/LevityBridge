@@ -594,12 +594,13 @@ export class BrainScanner {
           if (!ann || ann.cacheKey !== annCacheKey) {
             const txt = readFileSync(fPath, 'utf-8');
             const pinned = /\bpinned:\s*true\b/.test(txt);
+            const archived = /\barchived:\s*true\b/.test(txt);
             const title = parsePbtxtTitle(txt);
             const viewMatch = /last_user_view_time:\s*\{\s*seconds:\s*(\d+)(?:\s+nanos:\s*(\d+))?\s*\}/.exec(txt);
             const lastUserViewMs = viewMatch
               ? Number(viewMatch[1]) * 1000 + Math.floor(Number(viewMatch[2] || 0) / 1e6)
               : 0;
-            ann = { cacheKey: annCacheKey, mtimeMs: st.mtimeMs, pinned, title, lastUserViewMs };
+            ann = { cacheKey: annCacheKey, mtimeMs: st.mtimeMs, pinned, archived, title, lastUserViewMs };
             this.annotationsCache.set(fPath, ann);
           }
           const existing = result.get(convId) || {
@@ -611,11 +612,13 @@ export class BrainScanner {
             nestingDepth: 0,
             notFullyIdle: false,
             killed: false,
+            archived: false,
             modifiedMs: st.mtimeMs,
             pinned: false,
             lastUserViewMs: 0,
           };
           existing.pinned = Boolean(ann.pinned);
+          existing.archived = Boolean(ann.archived);
           // Desktop Antigravity updates `annotations/<id>.pbtxt` atomically upon every rename,
           // often before `conversation_summaries.db` WAL checkpoints flush.
           if (ann.title) {
@@ -1575,12 +1578,13 @@ export class BrainScanner {
       const runStatus = this.computeRunState(c.id, c.parsed, dbEntry, pendingInteraction);
       const modelAndMode = this.resolveModelAndMode(c.id, c.parsed);
       const pinned = Boolean(dbEntry?.pinned);
+      const archived = Boolean(dbEntry?.archived);
       const desktopViewedMs = dbEntry?.lastUserViewMs || 0;
       const iosViewedMs = savedMeta?.iosViewedMs || 0;
       const lastViewedMs = Math.max(desktopViewedMs, iosViewedMs);
       const lastReplyMs = c.parsed.lastAssistantReplyMs || 0;
       let hasUnread = false;
-      if (runStatus.state !== 'running') {
+      if (!archived && runStatus.state !== 'running') {
         if (pendingInteraction) {
           hasUnread = true;
         } else if (lastReplyMs > 0) {
@@ -1596,6 +1600,7 @@ export class BrainScanner {
         id: c.id,
         title,
         pinned,
+        archived,
         hasUnread,
         lastReplyMs,
         surface: c.surface,
@@ -1669,18 +1674,25 @@ export class BrainScanner {
     };
 
     let unreadCount = 0;
+    const archivedConversations = [];
     for (const conv of rootConversations) {
       const savedMeta = this.metaStore ? this.metaStore.getConversationMeta(conv.id) : null;
       if (conv.messageCount === 0 && !savedMeta) continue;
+      const { convDir, ...publicSummary } = conv;
+      if (conv.archived) {
+        archivedConversations.push(publicSummary);
+        continue;
+      }
       if (conv.hasUnread) unreadCount++;
 
       const isGlobal = !conv.workspacePath;
       const group = ensureWorkspace(conv.workspacePath, conv.workspaceName, isGlobal);
-      const { convDir, ...publicSummary } = conv;
       group.conversations.push(publicSummary);
       if (conv.runState === 'running') group.activeCount++;
       if (conv.updatedMs > group.latestUpdatedMs) group.latestUpdatedMs = conv.updatedMs;
     }
+
+    archivedConversations.sort((a, b) => b.updatedMs - a.updatedMs);
 
     const workspaces = [...workspaceMap.values()].sort((a, b) => {
       if (a.activeCount !== b.activeCount) return b.activeCount - a.activeCount;
@@ -1696,8 +1708,9 @@ export class BrainScanner {
 
     return {
       workspaces,
+      archivedConversations,
       knownProjects: this.listKnownProjectFolders(),
-      totalConversations: rootConversations.length,
+      totalConversations: rootConversations.length - archivedConversations.length,
       unreadCount,
     };
   }
@@ -1806,6 +1819,7 @@ export class BrainScanner {
         id: convId,
         title,
         pinned: Boolean(dbEntry?.pinned),
+        archived: Boolean(dbEntry?.archived),
         parentConversationId,
         isSubagent,
         surface: basename(appData) === 'antigravity-cli' ? 'cli' : 'desktop',

@@ -1290,6 +1290,22 @@ test('BridgeServer syncs Desktop annotations/*.pbtxt renames immediately and ret
       assert.equal(convEv.detail.title, '桌面端新标题 🚀');
       assert.ok(wsEv, 'Desktop rename must emit workspaces_updated immediately');
       assert.equal(wsEv.workspaces[0].conversations[0].title, '桌面端新标题 🚀');
+
+      // Now simulate user archiving the conversation on Desktop (`archived:true` in annotations/*.pbtxt)
+      bridge.ringBuffer.length = 0;
+      await new Promise((r) => setTimeout(r, 20));
+      writeFileSync(
+        join(appData, 'annotations', `${convId}.pbtxt`),
+        'title:"桌面端新标题 🚀" archived:true archival_status_timestamp:{seconds:1795316000}\n',
+        'utf-8'
+      );
+      await bridge.pollChanges();
+      const archiveWsEv = bridge.ringBuffer.find((e) => e.type === 'workspaces_updated');
+      assert.ok(archiveWsEv, 'Desktop archive must immediately emit workspaces_updated');
+      assert.equal(archiveWsEv.workspaces.flatMap((w) => w.conversations).length, 0, 'Archived session must disappear from active list');
+      assert.equal(archiveWsEv.archivedConversations.length, 1, 'Archived session must appear in archivedConversations');
+      assert.equal(archiveWsEv.archivedConversations[0].id, convId);
+      assert.equal(archiveWsEv.archivedConversations[0].archived, true);
     } finally {
       await bridge.stop();
     }

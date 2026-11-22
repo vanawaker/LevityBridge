@@ -1,6 +1,6 @@
 {
   "name": "levity-bridge",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Open-source companion desktop bridge plugin for Levity (iPhone, iPad & iPhone Duo)",
   "type": "module",
   "private": false,

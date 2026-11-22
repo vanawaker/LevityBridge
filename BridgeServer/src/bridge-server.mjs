@@ -212,6 +212,7 @@ export class BridgeServer {
     this.ringBuffer = [];
     this.wsClients = new Set();
     this.convFingerprints = new Map();
+    this.lastArchivedFingerprint = null;
     this.lastQuotaFingerprint = '';
     this.lastUnreadCount = 0;
     this.notifiedInteractions = new Set();
@@ -309,9 +310,11 @@ export class BridgeServer {
       const scan = await this.brainScanner.scanAll({ includeMetadata: false });
       this.lastUnreadCount = typeof scan.unreadCount === 'number' ? scan.unreadCount : 0;
       let listChanged = false;
+      const seenIds = new Set();
 
       for (const ws of scan.workspaces) {
         for (const conv of ws.conversations) {
+          seenIds.add(conv.id);
           const fp = fingerprintSummary(conv);
           const prevFp = this.convFingerprints.get(conv.id);
           const isInitialBoot = this.seq === 0 && prevFp === undefined;
@@ -359,9 +362,27 @@ export class BridgeServer {
         }
       }
 
+      // Detect conversations archived, unarchived, or deleted on Desktop so mobile updates live
+      for (const oldId of [...this.convFingerprints.keys()]) {
+        if (!seenIds.has(oldId)) {
+          this.convFingerprints.delete(oldId);
+          listChanged = true;
+        }
+      }
+
+      const archivedList = scan.archivedConversations || [];
+      const archivedFp = archivedList
+        .map((c) => `${c.id}:${c.title}:${c.updatedMs}:${c.lastPreview}`)
+        .join('|');
+      if (this.lastArchivedFingerprint !== null && this.lastArchivedFingerprint !== archivedFp) {
+        listChanged = true;
+      }
+      this.lastArchivedFingerprint = archivedFp;
+
       if (listChanged) {
         this.emitEvent('workspaces_updated', {
           workspaces: scan.workspaces,
+          archivedConversations: archivedList,
         });
       }
 
@@ -621,6 +642,7 @@ export class BridgeServer {
         this.#sendJson(res, 200, {
           server: this.getPublicStatus(),
           workspaces: scan.workspaces,
+          archivedConversations: scan.archivedConversations || [],
           knownProjects: scan.knownProjects,
           modelFamilies: MODEL_FAMILIES,
           quota,
