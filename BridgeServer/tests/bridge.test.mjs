@@ -1405,3 +1405,155 @@ test('BridgeServer persists conversation to-do flag and broadcasts workspaces_up
     rmSync(sandbox, { recursive: true, force: true });
   }
 });
+
+test('Stop hook suppresses mid-task notifications while background command/subagent is pending and notifies only on final reply', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-bg-notify-'));
+  try {
+    const appData = join(sandbox, 'appData');
+    const stateDir = join(sandbox, 'state');
+    const convId = 'bg-task-conv-0001';
+    const convDir = join(appData, 'brain', convId);
+    const logsDir = join(convDir, '.system_generated', 'logs');
+    mkdirSync(logsDir, { recursive: true });
+    const transcriptPath = join(logsDir, 'transcript.jsonl');
+
+    const nowIso = new Date().toISOString();
+    const initialSteps = [
+      { step_index: 1, type: 'USER_INPUT', created_at: nowIso, content: '修一下三个 Bug' },
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        created_at: nowIso,
+        tool_calls: [{ id: 'tc-1', name: 'run_command', args: { CommandLine: 'xcodebuild test' } }],
+        content: '',
+      },
+      {
+        step_index: 3,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        created_at: nowIso,
+        content: `Tool is running as a background task with task id: ${convId}/task-42\nTask Description: xcodebuild test`,
+      },
+      {
+        step_index: 4,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: nowIso,
+        tool_calls: [],
+        content: 'Waiting for background test task-42 to complete.',
+      },
+    ];
+    writeFileSync(transcriptPath, initialSteps.map((s) => JSON.stringify(s)).join('\n') + '\n', 'utf-8');
+
+    const metaStore = new MetaStore({ stateDir });
+    const scanner = new BrainScanner({ appDataDirs: [appData], metaStore });
+    const pushedAlerts = [];
+    const bridge = new BridgeServer({
+      port: 0,
+      host: '127.0.0.1',
+      metaStore,
+      brainScanner: scanner,
+      agentController: new AgentController({ agentApiPath: 'mock-agentapi', execFn: async () => ({ stdout: '{}' }) }),
+      pollIntervalMs: 60_000,
+    });
+    bridge.apnsPusher.notifyConversation = async (args) => {
+      pushedAlerts.push(args);
+      return { ok: true, sent: 1 };
+    };
+    await bridge.start();
+    try {
+      const port = bridge.getBoundPort();
+      const hookSecret = metaStore.getHookSecret();
+      await bridge.pollChanges();
+
+      // 1. Mid-task Stop hook while task-42 is still running -> MUST suppress push & keep running!
+      const detMid = await scanner.getConversationDetail(convId);
+      assert.equal(detMid.hasPendingBackgroundTasks, true);
+      assert.equal(detMid.runState, 'running');
+
+      const stopMid = await fetch(`http://127.0.0.1:${port}/internal/hook`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-antigravityz-hook-secret': hookSecret,
+        },
+        body: JSON.stringify({
+          hookEventName: 'Stop',
+          conversationId: convId,
+          continuationActive: false,
+        }),
+      });
+      assert.equal(stopMid.status, 200);
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(pushedAlerts.length, 0, 'Mid-task Stop while background task is pending must NEVER push a notification!');
+      assert.equal(
+        bridge.ringBuffer.filter((e) => e.type === 'notification_event').length,
+        0,
+        'Mid-task Stop must NOT emit in-app notification_event!'
+      );
+
+      // 2. Background task finishes + daemon server starts (IsDaemon: true) + agent emits final Chinese reply -> MUST notify ONCE!
+      const finalSteps = [
+        ...initialSteps,
+        {
+          step_index: 5,
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          created_at: new Date(Date.now() + 1000).toISOString(),
+          content: `<SYSTEM_MESSAGE>\n[Message] sender=${convId}/task-42 content=Task id "${convId}/task-42" finished with result:\n** TEST SUCCEEDED **`,
+        },
+        {
+          step_index: 6,
+          type: 'PLANNER_RESPONSE',
+          created_at: new Date(Date.now() + 1500).toISOString(),
+          tool_calls: [{ id: 'tc-2', name: 'run_command', args: { CommandLine: 'npm run dev', IsDaemon: true } }],
+          content: '',
+        },
+        {
+          step_index: 7,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          created_at: new Date(Date.now() + 1600).toISOString(),
+          content: `Tool is running as a background task with task id: ${convId}/task-daemon-99`,
+        },
+        {
+          step_index: 8,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: new Date(Date.now() + 2000).toISOString(),
+          tool_calls: [],
+          content: '三条全修完了，测试全绿，随时可以推包。',
+        },
+      ];
+      writeFileSync(transcriptPath, finalSteps.map((s) => JSON.stringify(s)).join('\n') + '\n', 'utf-8');
+
+      const detDone = await scanner.getConversationDetail(convId);
+      assert.equal(detDone.hasPendingBackgroundTasks, false, 'Completed task + IsDaemon server must NOT block final completion!');
+      assert.equal(detDone.runState, 'idle');
+
+      const stopFinal = await fetch(`http://127.0.0.1:${port}/internal/hook`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-antigravityz-hook-secret': hookSecret,
+        },
+        body: JSON.stringify({
+          hookEventName: 'Stop',
+          conversationId: convId,
+          continuationActive: false,
+        }),
+      });
+      assert.equal(stopFinal.status, 200);
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(pushedAlerts.length, 1, 'Final Stop must dispatch EXACTLY ONE notification!');
+      assert.ok(
+        pushedAlerts[0].body.includes('三条全修完了'),
+        `Expected final reply in push body, got: ${pushedAlerts[0].body}`
+      );
+    } finally {
+      await bridge.stop();
+    }
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});

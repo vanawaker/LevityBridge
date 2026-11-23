@@ -751,6 +751,9 @@ export class BrainScanner {
       detectedMode: null,
       unansweredQuestion: null,
       spawnedSubagents: [],
+      hasPendingBackgroundTasks: false,
+      pendingTaskCount: 0,
+      pendingSubagentCount: 0,
       mtimeMs: 0,
     };
     const tPath = this.findTranscriptPath(convDir);
@@ -770,6 +773,8 @@ export class BrainScanner {
     const lines = rawText.split('\n');
     const items = [];
     const spawnedSubagents = [];
+    const turnPendingTasks = new Map(); // taskId -> startedAtMs
+    const turnPendingSubagents = new Map(); // subagentConvId -> startedAtMs
     let firstUserText = '';
     let lastPreview = '';
     let lastTimestamp = null;
@@ -822,6 +827,8 @@ export class BrainScanner {
       if (step.type === 'USER_INPUT') {
         pendingToolBatch = null;
         unansweredQuestion = null;
+        turnPendingTasks.clear();
+        turnPendingSubagents.clear();
         const rawContent = step.content || '';
         const settings = extractSettingsChanges(rawContent);
         if (settings.modelName) {
@@ -862,10 +869,13 @@ export class BrainScanner {
           createdAt,
         });
       } else if (step.type === 'SYSTEM_MESSAGE') {
-        const mobile = extractMobilePrompt(step.content || '');
+        const sysContent = String(step.content || '');
+        const mobile = extractMobilePrompt(sysContent);
         if (mobile && mobile.text) {
           pendingToolBatch = null;
           unansweredQuestion = null;
+          turnPendingTasks.clear();
+          turnPendingSubagents.clear();
           if (mobile.mode) detectedMode = mobile.mode;
           if (!firstUserText && !mobile.isControlOnly) firstUserText = mobile.text;
           lastPreview = mobile.text.slice(0, 140);
@@ -898,17 +908,48 @@ export class BrainScanner {
             attachments: [],
             createdAt,
           });
+        } else {
+          // Track completion of background tasks & subagents launched during the active turn
+          const senderMatch = /\bsender=([^\s\n]+)/.exec(sysContent);
+          if (senderMatch) {
+            turnPendingTasks.delete(senderMatch[1]);
+            turnPendingSubagents.delete(senderMatch[1]);
+          }
+          const taskDoneMatch =
+            /Task id "([^"]+)"\s+(?:finished|failed|cancelled|canceled|killed|stopped|exited)/i.exec(sysContent);
+          if (taskDoneMatch) {
+            turnPendingTasks.delete(taskDoneMatch[1]);
+          }
         }
       } else if (step.type === 'PLANNER_RESPONSE') {
         const rawToolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
         const cleanVal = (v) => String(v ?? '').replace(/^"|"$/g, '').trim();
+        const batchMeta = [];
         const mappedTools = rawToolCalls.map((tc, i) => {
           const args = tc?.args || {};
           const tName = tc?.name || 'tool';
+          const rawDaemon = args.IsDaemon;
+          const isDaemon = rawDaemon === true || cleanVal(rawDaemon).toLowerCase() === 'true';
+          batchMeta.push({ isDaemon });
           const cleanPath = cleanVal(args.Path);
           const weight = (tName === 'write_file' || tName === 'edit_file') ? 5 : (tName === 'run_command' ? 3 : 1);
           scoreTextForProjects(cleanPath, weight);
           if (args.CommandLine) scoreTextForProjects(String(args.CommandLine), 3);
+
+          if (tName === 'manage_task' && cleanVal(args.Action) === 'kill') {
+            const killId = cleanVal(args.TaskId);
+            if (killId) turnPendingTasks.delete(killId);
+          }
+          if (tName === 'manage_subagents') {
+            const act = cleanVal(args.Action);
+            if (act === 'kill_all') {
+              turnPendingSubagents.clear();
+            } else if (act === 'kill' && Array.isArray(args.ConversationIds)) {
+              for (const cid of args.ConversationIds) {
+                turnPendingSubagents.delete(cleanVal(cid));
+              }
+            }
+          }
 
           if (tName === 'swarm' && cleanVal(args.action) === 'model') {
             const targetName = cleanVal(args.name);
@@ -977,9 +1018,10 @@ export class BrainScanner {
           createdAt,
         };
         items.push(assistantItem);
-        pendingToolBatch = mappedTools.length > 0 ? { tools: mappedTools, cursor: 0 } : null;
+        pendingToolBatch = mappedTools.length > 0 ? { tools: mappedTools, meta: batchMeta, cursor: 0 } : null;
       } else if (step.type === 'GENERIC' && pendingToolBatch) {
         const targetTool = pendingToolBatch.tools[pendingToolBatch.cursor];
+        const targetMeta = pendingToolBatch.meta?.[pendingToolBatch.cursor] || { isDaemon: false };
         if (targetTool) {
           const out = String(step.content || '').trim();
           targetTool.outputPreview = out.slice(0, 600);
@@ -990,6 +1032,21 @@ export class BrainScanner {
           const convMatch = /conversationId["\s:=]+([0-9a-f-]{36})/i.exec(out);
           if (convMatch && targetTool.name === 'invoke_subagent') {
             targetTool.subagentConversationId = convMatch[1];
+            const startedMs = createdAt ? Date.parse(createdAt) || st.mtimeMs : st.mtimeMs;
+            turnPendingSubagents.set(convMatch[1], startedMs);
+          }
+          if (!targetMeta.isDaemon) {
+            const bgTaskMatch = /Tool is running as a background task with task id:\s*([^\s\n]+)/i.exec(out);
+            if (bgTaskMatch) {
+              const startedMs = createdAt ? Date.parse(createdAt) || st.mtimeMs : st.mtimeMs;
+              turnPendingTasks.set(bgTaskMatch[1], startedMs);
+            } else if (
+              step.status === 'RUNNING' &&
+              (targetTool.name === 'run_command' || targetTool.name === 'run_workflow')
+            ) {
+              const startedMs = createdAt ? Date.parse(createdAt) || st.mtimeMs : st.mtimeMs;
+              turnPendingTasks.set(`step-${stepIdx}`, startedMs);
+            }
           }
           pendingToolBatch.cursor++;
         }
@@ -1052,6 +1109,22 @@ export class BrainScanner {
       }
     }
 
+    const nowMs = Date.now();
+    const MAX_PENDING_TASK_AGE_MS = 20 * 60 * 1000;
+    let pendingTaskCount = 0;
+    for (const startedMs of turnPendingTasks.values()) {
+      if (!startedMs || nowMs - startedMs < MAX_PENDING_TASK_AGE_MS) {
+        pendingTaskCount++;
+      }
+    }
+    let pendingSubagentCount = 0;
+    for (const startedMs of turnPendingSubagents.values()) {
+      if (!startedMs || nowMs - startedMs < MAX_PENDING_TASK_AGE_MS) {
+        pendingSubagentCount++;
+      }
+    }
+    const hasPendingBackgroundTasks = pendingTaskCount > 0 || pendingSubagentCount > 0;
+
     const parsed = {
       items: mergedItems,
       firstUserText,
@@ -1066,6 +1139,9 @@ export class BrainScanner {
       detectedMode,
       unansweredQuestion,
       spawnedSubagents,
+      hasPendingBackgroundTasks,
+      pendingTaskCount,
+      pendingSubagentCount,
       mtimeMs: st.mtimeMs,
     };
     this.transcriptCache.set(tPath, { key: cacheKey, parsed });
@@ -1381,6 +1457,17 @@ export class BrainScanner {
         state: 'running',
         activity: hook.activity,
         detail: hook.detail || '思考中…',
+      };
+    }
+    if (parsedTranscript.hasPendingBackgroundTasks) {
+      const detailMsg =
+        parsedTranscript.pendingSubagentCount > 0 && parsedTranscript.pendingTaskCount === 0
+          ? '等待子代理完成…'
+          : '等待后台任务完成…';
+      return {
+        state: 'running',
+        activity: 'working',
+        detail: detailMsg,
       };
     }
     if (dbEntry && (dbEntry.status === 'CASCADE_RUN_STATUS_RUNNING' || dbEntry.notFullyIdle)) {
@@ -1829,6 +1916,8 @@ export class BrainScanner {
         workspaceName,
         runState: runStatus.state,
         activityDetail: runStatus.detail,
+        hasPendingBackgroundTasks: Boolean(parsed.hasPendingBackgroundTasks),
+        notFullyIdle: Boolean(dbEntry?.notFullyIdle),
         detectedModelId: modelAndMode.detectedModelId,
         currentModelId: modelAndMode.currentModelId,
         currentModelDisplay: modelAndMode.currentModelDisplay,

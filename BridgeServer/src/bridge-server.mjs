@@ -406,7 +406,7 @@ export class BridgeServer {
   }
 
   #stripPrivateDetail(detail, { limit = 30 } = {}) {
-    const { convDir, detectedModelId, items = [], ...rest } = detail;
+    const { convDir, detectedModelId, hasPendingBackgroundTasks, notFullyIdle, items = [], ...rest } = detail;
     const totalItemCount = items.length;
     const sliced = limit && limit > 0 && totalItemCount > limit ? items.slice(-limit) : items;
     const len = sliced.length;
@@ -580,12 +580,18 @@ export class BridgeServer {
               payload?.terminationReason !== 'USER_CANCELED'
             ) {
               const detail = await this.brainScanner.getConversationDetail(convId);
-              if (detail && !detail.isSubagent && !detail.pendingInteraction) {
+              const isErrorStop = payload?.terminationReason === 'ERROR';
+              // Suppress intermediate notifications when the agent only paused to wait for
+              // its own background command / workflow / subagent (matching official Desktop UX).
+              const isWaitingOnBackgroundWork =
+                !isErrorStop &&
+                Boolean(detail?.hasPendingBackgroundTasks || detail?.notFullyIdle);
+              if (detail && !detail.isSubagent && !detail.pendingInteraction && !isWaitingOnBackgroundWork) {
                 const lastAssistant = [...detail.items].reverse().find((it) => it.role === 'assistant' && it.content);
                 const bodyText = lastAssistant?.content
                   ? lastAssistant.content.replace(/[#*`>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 140)
-                  : (payload?.terminationReason === 'ERROR' ? '会话执行过程中遇到错误' : '本轮任务已完成');
-                const kind = payload?.terminationReason === 'ERROR' ? 'error' : 'completed';
+                  : (isErrorStop ? '会话执行过程中遇到错误' : '本轮任务已完成');
+                const kind = isErrorStop ? 'error' : 'completed';
                 const subParts = [];
                 if (detail.title && detail.title !== 'Antigravity' && detail.title !== 'Levity') subParts.push(detail.title);
                 if (kind === 'error') subParts.push('执行异常');
