@@ -581,11 +581,14 @@ export class BridgeServer {
             ) {
               const detail = await this.brainScanner.getConversationDetail(convId);
               const isErrorStop = payload?.terminationReason === 'ERROR';
-              // Suppress intermediate notifications when the agent only paused to wait for
-              // its own background command / workflow / subagent (matching official Desktop UX).
+              // Suppress intermediate notifications ONLY when the transcript explicitly shows
+              // an unfinished non-daemon background command / workflow / schedule / subagent
+              // launched during this turn. Do NOT gate on `detail.notFullyIdle` because
+              // Antigravity fires the `Stop` hook synchronously BEFORE flipping
+              // `conversation_summaries.not_fully_idle` back to 0!
               const isWaitingOnBackgroundWork =
                 !isErrorStop &&
-                Boolean(detail?.hasPendingBackgroundTasks || detail?.notFullyIdle);
+                Boolean(detail?.hasPendingBackgroundTasks);
               if (detail && !detail.isSubagent && !detail.pendingInteraction && !isWaitingOnBackgroundWork) {
                 const lastAssistant = [...detail.items].reverse().find((it) => it.role === 'assistant' && it.content);
                 const bodyText = lastAssistant?.content

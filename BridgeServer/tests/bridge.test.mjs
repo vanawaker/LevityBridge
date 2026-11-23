@@ -1492,7 +1492,32 @@ test('Stop hook suppresses mid-task notifications while background command/subag
         'Mid-task Stop must NOT emit in-app notification_event!'
       );
 
-      // 2. Background task finishes + daemon server starts (IsDaemon: true) + agent emits final Chinese reply -> MUST notify ONCE!
+      // 2. Background task finishes + daemon server starts (IsDaemon: true) + read_file cites bg text
+      //    + conversation_summaries.db STILL has not_fully_idle=1 during Stop hook -> MUST STILL notify ONCE!
+      const sumDb = new DatabaseSync(join(appData, 'conversation_summaries.db'));
+      sumDb.exec(`
+        CREATE TABLE conversation_summaries (
+          conversation_id TEXT PRIMARY KEY,
+          title TEXT,
+          workspace_uris TEXT,
+          project_id TEXT,
+          status TEXT,
+          parent_conversation_id TEXT,
+          nesting_depth INTEGER,
+          not_fully_idle INTEGER,
+          killed INTEGER,
+          last_modified_time TEXT
+        );
+      `);
+      sumDb
+        .prepare(
+          `INSERT INTO conversation_summaries
+           (conversation_id, title, workspace_uris, project_id, status, parent_conversation_id, nesting_depth, not_fully_idle, killed, last_modified_time)
+           VALUES (?, ?, '', '', 'CASCADE_RUN_STATUS_RUNNING', '', 0, 1, 0, ?)`
+        )
+        .run(convId, 'Build Session', new Date(Date.now() + 2000).toISOString());
+      sumDb.close();
+
       const finalSteps = [
         ...initialSteps,
         {
@@ -1505,19 +1530,33 @@ test('Stop hook suppresses mid-task notifications while background command/subag
         {
           step_index: 6,
           type: 'PLANNER_RESPONSE',
+          created_at: new Date(Date.now() + 1400).toISOString(),
+          tool_calls: [{ id: 'tc-read', name: 'read_file', args: { Path: '/tmp/brain-scanner.mjs' } }],
+          content: '',
+        },
+        {
+          step_index: 7,
+          type: 'GENERIC',
+          status: 'DONE',
+          created_at: new Date(Date.now() + 1450).toISOString(),
+          content: '1039: Tool is running as a background task with task id: fake/99',
+        },
+        {
+          step_index: 8,
+          type: 'PLANNER_RESPONSE',
           created_at: new Date(Date.now() + 1500).toISOString(),
           tool_calls: [{ id: 'tc-2', name: 'run_command', args: { CommandLine: 'npm run dev', IsDaemon: true } }],
           content: '',
         },
         {
-          step_index: 7,
+          step_index: 9,
           type: 'GENERIC',
           status: 'RUNNING',
           created_at: new Date(Date.now() + 1600).toISOString(),
           content: `Tool is running as a background task with task id: ${convId}/task-daemon-99`,
         },
         {
-          step_index: 8,
+          step_index: 10,
           type: 'PLANNER_RESPONSE',
           status: 'DONE',
           created_at: new Date(Date.now() + 2000).toISOString(),
@@ -1528,8 +1567,8 @@ test('Stop hook suppresses mid-task notifications while background command/subag
       writeFileSync(transcriptPath, finalSteps.map((s) => JSON.stringify(s)).join('\n') + '\n', 'utf-8');
 
       const detDone = await scanner.getConversationDetail(convId);
-      assert.equal(detDone.hasPendingBackgroundTasks, false, 'Completed task + IsDaemon server must NOT block final completion!');
-      assert.equal(detDone.runState, 'idle');
+      assert.equal(detDone.hasPendingBackgroundTasks, false, 'Completed task + IsDaemon server + read_file quote must NOT block final completion!');
+      assert.equal(detDone.notFullyIdle, true, 'Simulates real Antigravity Stop hook firing before summaries.db flips not_fully_idle to 0');
 
       const stopFinal = await fetch(`http://127.0.0.1:${port}/internal/hook`, {
         method: 'POST',

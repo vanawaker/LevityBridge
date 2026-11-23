@@ -1035,8 +1035,12 @@ export class BrainScanner {
             const startedMs = createdAt ? Date.parse(createdAt) || st.mtimeMs : st.mtimeMs;
             turnPendingSubagents.set(convMatch[1], startedMs);
           }
-          if (!targetMeta.isDaemon) {
-            const bgTaskMatch = /Tool is running as a background task with task id:\s*([^\s\n]+)/i.exec(out);
+          const isAsyncBgTool =
+            targetTool.name === 'run_command' ||
+            targetTool.name === 'run_workflow' ||
+            targetTool.name === 'schedule';
+          if (!targetMeta.isDaemon && isAsyncBgTool) {
+            const bgTaskMatch = /^Tool is running as a background task with task id:\s*([^\s\n]+)/im.exec(out);
             if (bgTaskMatch) {
               const startedMs = createdAt ? Date.parse(createdAt) || st.mtimeMs : st.mtimeMs;
               turnPendingTasks.set(bgTaskMatch[1], startedMs);
