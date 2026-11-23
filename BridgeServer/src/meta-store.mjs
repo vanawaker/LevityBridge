@@ -128,17 +128,45 @@ export class MetaStore {
     return typeof val === 'number' && Number.isFinite(val) ? val : 0;
   }
 
-  markConversationViewed(convId, viewedMs = Date.now()) {
+  markConversationViewed(convId, viewedMs = Date.now(), cursor = null) {
     if (!convId) return 0;
     const prev = this.conversations[convId] || {};
     const prevMs = typeof prev.iosViewedMs === 'number' ? prev.iosViewedMs : 0;
     const nextMs = Math.max(prevMs, Math.floor(Number(viewedMs) || Date.now()));
-    if (nextMs === prevMs) return prevMs;
-    this.conversations[convId] = {
+
+    const prevStepIndex =
+      typeof prev.iosViewedStepIndex === 'number' && Number.isFinite(prev.iosViewedStepIndex)
+        ? prev.iosViewedStepIndex
+        : null;
+    const prevReplySig = typeof prev.iosViewedReplySig === 'string' ? prev.iosViewedReplySig : '';
+
+    let nextStepIndex = prevStepIndex;
+    let nextReplySig = prevReplySig;
+    if (cursor && typeof cursor.stepIndex === 'number' && Number.isFinite(cursor.stepIndex)) {
+      const incomingStep = Math.floor(cursor.stepIndex);
+      const incomingSig = typeof cursor.replySig === 'string' ? cursor.replySig : '';
+      if (prevStepIndex === null || incomingStep > prevStepIndex) {
+        nextStepIndex = incomingStep;
+        nextReplySig = incomingSig;
+      } else if (incomingStep === prevStepIndex && incomingSig && incomingSig !== prevReplySig) {
+        nextReplySig = incomingSig;
+      }
+    }
+
+    if (nextMs === prevMs && nextStepIndex === prevStepIndex && nextReplySig === prevReplySig) {
+      return prevMs;
+    }
+
+    const updated = {
       ...prev,
       iosViewedMs: nextMs,
       updatedAt: new Date(nextMs).toISOString(),
     };
+    if (nextStepIndex !== null) {
+      updated.iosViewedStepIndex = nextStepIndex;
+      updated.iosViewedReplySig = nextReplySig;
+    }
+    this.conversations[convId] = updated;
     this.#saveMeta();
     return nextMs;
   }
@@ -147,17 +175,28 @@ export class MetaStore {
     return Boolean(this.conversations[convId]?.flagged);
   }
 
-  setConversationFlagged(convId, flagged) {
+  setConversationFlagged(convId, flagged, flagNote = undefined) {
     if (!convId) return null;
     const prev = this.conversations[convId] || {};
     const nextFlagged = Boolean(flagged);
     const nowMs = Date.now();
-    this.conversations[convId] = {
+    const next = {
       ...prev,
       flagged: nextFlagged,
       flaggedUpdatedAtMs: nowMs,
       updatedAt: new Date(nowMs).toISOString(),
     };
+    if (!nextFlagged) {
+      delete next.flagNote;
+    } else if (flagNote !== undefined) {
+      const cleanNote = String(flagNote ?? '').replace(/\s+/g, ' ').trim();
+      if (cleanNote) {
+        next.flagNote = Array.from(cleanNote).slice(0, 60).join('');
+      } else {
+        delete next.flagNote;
+      }
+    }
+    this.conversations[convId] = next;
     this.#saveMeta();
     return this.conversations[convId];
   }

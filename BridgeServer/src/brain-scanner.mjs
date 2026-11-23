@@ -4,6 +4,7 @@
  * parses untruncated transcripts, active model/thinking settings, and interactive
  * questions/permission waits, resolves workspace grouping, and nests subagents.
  */
+import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, extname, join, resolve as resolvePath, sep } from 'node:path';
@@ -14,6 +15,10 @@ import { lookupModelInfo } from './model-catalog.mjs';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_CONV_RE = /^[0-9a-zA-Z_-]{6,64}$/;
 const ARTIFACT_EXTS = new Set(['.md', '.png', '.jpg', '.jpeg', '.webp', '.svg', '.txt', '.json']);
+
+function replyDigest(text) {
+  return createHash('sha256').update(text).digest('hex').slice(0, 16);
+}
 
 function extractSettingsChanges(raw) {
   if (!raw || typeof raw !== 'string') return { modelName: null };
@@ -754,6 +759,8 @@ export class BrainScanner {
       lastPreview: '',
       lastTimestamp: null,
       lastAssistantReplyMs: 0,
+      lastAssistantStepIndex: -1,
+      lastAssistantReplySig: '',
       stepCount: 0,
       lastStepIndex: null,
       lastStepType: null,
@@ -790,6 +797,9 @@ export class BrainScanner {
     let lastPreview = '';
     let lastTimestamp = null;
     let lastAssistantReplyMs = 0;
+    let lastAssistantStepIndex = -1;
+    let lastAssistantReplySig = '';
+    let hasNonBookkeepingStepAfterLastAssistant = false;
     let stepCount = 0;
     let lastStepIndex = null;
     let lastStepType = null;
@@ -836,6 +846,9 @@ export class BrainScanner {
       lastStepType = step.type || null;
 
       if (step.type === 'USER_INPUT') {
+        if (lastAssistantStepIndex >= 0) {
+          hasNonBookkeepingStepAfterLastAssistant = true;
+        }
         pendingToolBatch = null;
         unansweredQuestion = null;
         turnPendingTasks.clear();
@@ -883,6 +896,9 @@ export class BrainScanner {
         const sysContent = String(step.content || '');
         const mobile = extractMobilePrompt(sysContent);
         if (mobile && mobile.text) {
+          if (lastAssistantStepIndex >= 0) {
+            hasNonBookkeepingStepAfterLastAssistant = true;
+          }
           pendingToolBatch = null;
           unansweredQuestion = null;
           turnPendingTasks.clear();
@@ -1010,6 +1026,13 @@ export class BrainScanner {
           if (effectiveReplyMs > lastAssistantReplyMs) {
             lastAssistantReplyMs = effectiveReplyMs;
           }
+          if (stepIdx >= lastAssistantStepIndex) {
+            lastAssistantStepIndex = stepIdx;
+            lastAssistantReplySig = `${stepIdx}:${content.length}:${assistantAtts.length}:${replyDigest(content)}`;
+            hasNonBookkeepingStepAfterLastAssistant = false;
+          }
+        } else if (mappedTools.length > 0 && lastAssistantStepIndex >= 0) {
+          hasNonBookkeepingStepAfterLastAssistant = true;
         }
         if (content) {
           lastPreview = content.replace(/\s+/g, ' ').slice(0, 140);
@@ -1033,6 +1056,9 @@ export class BrainScanner {
         items.push(assistantItem);
         pendingToolBatch = mappedTools.length > 0 ? { tools: mappedTools, meta: batchMeta, cursor: 0 } : null;
       } else if (step.type === 'GENERIC' && pendingToolBatch) {
+        if (lastAssistantStepIndex >= 0) {
+          hasNonBookkeepingStepAfterLastAssistant = true;
+        }
         const targetTool = pendingToolBatch.tools[pendingToolBatch.cursor];
         const targetMeta = pendingToolBatch.meta?.[pendingToolBatch.cursor] || { isDaemon: false };
         if (targetTool) {
@@ -1074,6 +1100,11 @@ export class BrainScanner {
         const effectiveErrMs = Number.isFinite(errMs) && errMs > 0 ? errMs : st.mtimeMs;
         if (effectiveErrMs > lastAssistantReplyMs) {
           lastAssistantReplyMs = effectiveErrMs;
+        }
+        if (stepIdx >= lastAssistantStepIndex) {
+          lastAssistantStepIndex = stepIdx;
+          lastAssistantReplySig = `${stepIdx}:err:${errText.length}:${replyDigest(errText)}`;
+          hasNonBookkeepingStepAfterLastAssistant = false;
         }
         items.push({
           id: `step-${stepIdx}`,
@@ -1143,12 +1174,25 @@ export class BrainScanner {
     }
     const hasPendingBackgroundTasks = pendingTaskCount > 0 || pendingSubagentCount > 0;
 
+    const MAX_TURN_GENERATION_MS = 20 * 60 * 1000;
+    if (
+      lastAssistantStepIndex >= 0 &&
+      lastStepIndex === lastAssistantStepIndex &&
+      !hasNonBookkeepingStepAfterLastAssistant &&
+      st.mtimeMs > lastAssistantReplyMs &&
+      st.mtimeMs - lastAssistantReplyMs <= MAX_TURN_GENERATION_MS
+    ) {
+      lastAssistantReplyMs = st.mtimeMs;
+    }
+
     const parsed = {
       items: mergedItems,
       firstUserText,
       lastPreview,
       lastTimestamp,
       lastAssistantReplyMs,
+      lastAssistantStepIndex,
+      lastAssistantReplySig,
       stepCount,
       lastStepIndex,
       lastStepType,
@@ -1482,7 +1526,7 @@ export class BrainScanner {
       hook.activity !== 'idle' &&
       (
         (lastItem?.role === 'error' && (lastItemMs >= hook.updatedAt - 1000 || parsedTranscript.mtimeMs >= hook.updatedAt)) ||
-        (lastItem?.role === 'assistant' && lastItem.isTurnFinal && lastItemMs > hook.updatedAt + 500 && dbEntry?.status === 'CASCADE_RUN_STATUS_IDLE' && !dbEntry?.notFullyIdle) ||
+        (lastItem?.role === 'assistant' && lastItem.isTurnFinal && Math.max(lastItemMs, parsedTranscript.lastAssistantReplyMs || 0) > hook.updatedAt + 500 && dbEntry?.status === 'CASCADE_RUN_STATUS_IDLE' && !dbEntry?.notFullyIdle) ||
         (dbEntry?.status === 'CASCADE_RUN_STATUS_IDLE' && !dbEntry?.notFullyIdle && dbEntry?.modifiedMs > hook.updatedAt + 800 && !parsedTranscript.hasPendingBackgroundTasks)
       )
     );
@@ -1749,20 +1793,42 @@ export class BrainScanner {
       const pinned = Boolean(dbEntry?.pinned);
       const archived = Boolean(dbEntry?.archived);
       const flagged = Boolean(savedMeta?.flagged);
+      const flagNote =
+        flagged && typeof savedMeta?.flagNote === 'string' && savedMeta.flagNote.trim()
+          ? savedMeta.flagNote.trim()
+          : null;
       const desktopViewedMs = dbEntry?.lastUserViewMs || 0;
       const iosViewedMs = savedMeta?.iosViewedMs || 0;
-      const viewedThresholdMs = Math.max(
-        desktopViewedMs > 0 ? desktopViewedMs + 1500 : 0,
-        iosViewedMs > 0 ? iosViewedMs + 250 : 0
-      );
+      const iosViewedStepIndex =
+        typeof savedMeta?.iosViewedStepIndex === 'number' && Number.isFinite(savedMeta.iosViewedStepIndex)
+          ? savedMeta.iosViewedStepIndex
+          : null;
+      const iosViewedReplySig = typeof savedMeta?.iosViewedReplySig === 'string' ? savedMeta.iosViewedReplySig : '';
       const lastReplyMs = c.parsed.lastAssistantReplyMs || 0;
+      const lastAssistantStepIndex =
+        typeof c.parsed.lastAssistantStepIndex === 'number' ? c.parsed.lastAssistantStepIndex : -1;
+      const lastAssistantReplySig = c.parsed.lastAssistantReplySig || '';
+      // Previously stored cursors used the same signature without the content digest.
+      const legacyReplySig = lastAssistantReplySig.slice(0, lastAssistantReplySig.lastIndexOf(':'));
       let hasUnread = false;
       if (!archived && runStatus.state !== 'running') {
         if (pendingInteraction) {
           hasUnread = true;
         } else if (lastReplyMs > 0) {
-          if (viewedThresholdMs > 0) {
-            hasUnread = lastReplyMs > viewedThresholdMs;
+          const readOnDesktop = desktopViewedMs > 0 && lastReplyMs <= desktopViewedMs + 1500;
+          let readOnIos = false;
+          if (iosViewedStepIndex !== null && lastAssistantStepIndex >= 0) {
+            readOnIos =
+              lastAssistantStepIndex < iosViewedStepIndex ||
+              (lastAssistantStepIndex === iosViewedStepIndex &&
+                (!iosViewedReplySig || iosViewedReplySig === lastAssistantReplySig || iosViewedReplySig === legacyReplySig));
+          } else if (iosViewedMs > 0) {
+            readOnIos = lastReplyMs <= iosViewedMs + 250;
+          }
+          if (readOnDesktop || readOnIos) {
+            hasUnread = false;
+          } else if (desktopViewedMs > 0 || iosViewedMs > 0 || iosViewedStepIndex !== null) {
+            hasUnread = true;
           } else {
             hasUnread = nowScanMs - lastReplyMs < 6 * 3600 * 1000;
           }
@@ -1775,6 +1841,7 @@ export class BrainScanner {
         pinned,
         archived,
         flagged,
+        flagNote,
         hasUnread,
         lastReplyMs,
         surface: c.surface,
@@ -1887,6 +1954,22 @@ export class BrainScanner {
       totalConversations: rootConversations.length - archivedConversations.length,
       unreadCount,
     };
+  }
+
+  getConversationReadCursor(convId) {
+    if (!SAFE_CONV_RE.test(String(convId || ''))) {
+      return { stepIndex: -1, replySig: '' };
+    }
+    for (const appData of this.discoverAppDataDirs()) {
+      const convDir = join(appData, 'brain', convId);
+      if (!existsSync(convDir)) continue;
+      const parsed = this.parseTranscript(convDir);
+      return {
+        stepIndex: typeof parsed.lastAssistantStepIndex === 'number' ? parsed.lastAssistantStepIndex : -1,
+        replySig: parsed.lastAssistantReplySig || '',
+      };
+    }
+    return { stepIndex: -1, replySig: '' };
   }
 
   async getConversationDetail(convId) {

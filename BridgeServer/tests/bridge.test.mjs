@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -75,6 +75,115 @@ test('QR SVG generator produces valid crisp SVG for pairing URIs', () => {
   const svg = generateQrSvg(uri);
   assert.ok(svg.startsWith('<svg xmlns="http://www.w3.org/2000/svg"'));
   assert.ok(svg.includes('<path d="M'));
+});
+
+function createReadCursorFixture(t) {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-read-cursor-'));
+  t.after(() => rmSync(sandbox, { recursive: true, force: true }));
+  const appData = join(sandbox, 'appData');
+  const convId = '451186a3-1111-4222-8333-444444444444';
+  const convDir = join(appData, 'brain', convId);
+  const logsDir = join(convDir, '.system_generated', 'logs');
+  mkdirSync(logsDir, { recursive: true });
+  const transcript = join(logsDir, 'transcript.jsonl');
+  const metaStore = new MetaStore({ stateDir: join(sandbox, 'state') });
+  const scanner = new BrainScanner({ appDataDirs: [appData], projectsRoot: sandbox, projectsConfigDir: sandbox, metaStore });
+  const replyTime = new Date(Math.floor(Date.now() / 1000) * 1000 - 10_000);
+  const reply = {
+    step_index: 17,
+    type: 'PLANNER_RESPONSE',
+    status: 'DONE',
+    created_at: replyTime.toISOString(),
+    content: 'alpha',
+  };
+  const writeTranscript = (steps, mtime) => {
+    writeFileSync(transcript, `${steps.map((step) => JSON.stringify(step)).join('\n')}\n`);
+    utimesSync(transcript, mtime, mtime);
+  };
+  const findConversation = async () => {
+    const { workspaces } = await scanner.scanAll({ includeMetadata: false });
+    const conversation = workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
+    assert.ok(conversation);
+    return conversation;
+  };
+  writeTranscript([reply], replyTime);
+  return { appData, convId, metaStore, scanner, replyTime, reply, writeTranscript, findConversation };
+}
+
+test('WebSocket presence advances the iOS viewed step and reply signature', { timeout: 5000 }, async (t) => {
+  const { convId, metaStore, scanner } = createReadCursorFixture(t);
+  const bridge = new BridgeServer({ port: 0, host: '127.0.0.1', metaStore, brainScanner: scanner });
+  await bridge.start();
+  try {
+    const token = encodeURIComponent(metaStore.getToken());
+    const ws = new WebSocket(`ws://127.0.0.1:${bridge.getBoundPort()}/api/v1/stream?token=${token}`);
+    try {
+      await new Promise((resolve, reject) => {
+        const deadline = AbortSignal.timeout(3000);
+        deadline.addEventListener('abort', () => reject(deadline.reason), { once: true });
+        ws.addEventListener('error', reject, { once: true });
+        ws.addEventListener('open', () => {
+          ws.send(JSON.stringify({ type: 'presence', deviceId: 'test-ios', active: true, visibleConversationId: convId }));
+          ws.send(JSON.stringify({ type: 'ping' }));
+        }, { once: true });
+        ws.addEventListener('message', (event) => {
+          if (JSON.parse(String(event.data)).type === 'pong') resolve();
+        });
+      });
+      const meta = metaStore.getConversationMeta(convId);
+      assert.equal(meta?.iosViewedStepIndex, 17);
+      assert.equal(meta?.iosViewedReplySig, scanner.getConversationReadCursor(convId).replySig);
+    } finally {
+      ws.close();
+    }
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('An equal-length edit to a read reply makes the same step unread again', async (t) => {
+  const { convId, metaStore, scanner, replyTime, reply, writeTranscript, findConversation } = createReadCursorFixture(t);
+  const cursor = scanner.getConversationReadCursor(convId);
+  metaStore.markConversationViewed(convId, Date.now(), { stepIndex: 17, replySig: '17:5:0' });
+  assert.equal((await findConversation()).hasUnread, false, 'Legacy read cursors remain valid');
+  metaStore.markConversationViewed(convId, Date.now(), cursor);
+  assert.equal((await findConversation()).hasUnread, false);
+
+  writeTranscript([{ ...reply, content: 'omega' }], new Date(replyTime.getTime() + 1000));
+  const editedCursor = scanner.getConversationReadCursor(convId);
+  assert.equal(editedCursor.stepIndex, cursor.stepIndex);
+  assert.notEqual(editedCursor.replySig, cursor.replySig);
+  assert.equal((await findConversation()).hasUnread, true);
+});
+
+test('Trailing bookkeeping does not mark a Desktop-read reply unread', async (t) => {
+  const { appData, convId, replyTime, reply, writeTranscript, findConversation } = createReadCursorFixture(t);
+  const annotationsDir = join(appData, 'annotations');
+  mkdirSync(annotationsDir);
+  writeFileSync(join(annotationsDir, `${convId}.pbtxt`),
+    `title:"Read reply" last_user_view_time:{seconds:${replyTime.getTime() / 1000 + 1} nanos:0}\n`);
+  assert.equal((await findConversation()).hasUnread, false);
+
+  const bookkeepingTime = new Date(replyTime.getTime() + 5000);
+  writeTranscript([reply, {
+    step_index: 18,
+    type: 'SYSTEM_MESSAGE',
+    status: 'DONE',
+    created_at: bookkeepingTime.toISOString(),
+    content: 'Background bookkeeping completed.',
+  }], bookkeepingTime);
+  assert.equal((await findConversation()).hasUnread, false);
+});
+
+test('MetaStore caps flag notes by code point and preserves an emoji at the boundary', (t) => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-flag-note-'));
+  t.after(() => rmSync(sandbox, { recursive: true, force: true }));
+  const metaStore = new MetaStore({ stateDir: sandbox });
+  const expected = `${'a'.repeat(59)}🙂`;
+  const { flagNote } = metaStore.setConversationFlagged('flag-note-test', true, ` ${expected}tail `);
+  assert.equal(flagNote, expected);
+  assert.equal(Array.from(flagNote).length, 60);
+  assert.equal(flagNote.isWellFormed(), true);
 });
 
 test('BridgeServer handles Desktop titles, PreInvocation userMessage injection, questions, and APNs push', async () => {
@@ -1360,7 +1469,7 @@ test('BridgeServer persists conversation to-do flag and broadcasts workspaces_up
       assert.ok(conv0, 'Conversation must appear in /api/v1/bootstrap');
       assert.equal(conv0.flagged, false);
 
-      // Flag it via POST /api/v1/conversations/:id/flag
+      // Flag it with an optional memo note via POST /api/v1/conversations/:id/flag
       bridge.ringBuffer.length = 0;
       const flagRes = await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${convId}/flag`, {
         method: 'POST',
@@ -1368,19 +1477,39 @@ test('BridgeServer persists conversation to-do flag and broadcasts workspaces_up
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ flagged: true }),
+        body: JSON.stringify({ flagged: true, flagNote: '  Ship v1.0.7 next  ' }),
       });
       assert.equal(flagRes.status, 200);
       const flagJson = await flagRes.json();
       assert.equal(flagJson.ok, true);
       assert.equal(flagJson.flagged, true);
+      assert.equal(flagJson.flagNote, 'Ship v1.0.7 next');
 
       const wsFlagEv = bridge.ringBuffer.find((e) => e.type === 'workspaces_updated');
       assert.ok(wsFlagEv, 'Flagging must broadcast workspaces_updated to other paired devices');
       const flaggedConv = wsFlagEv.workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
       assert.equal(flaggedConv?.flagged, true);
+      assert.equal(flaggedConv?.flagNote, 'Ship v1.0.7 next');
 
-      // Unflag it
+      // Updating flagNote while flagged must also broadcast workspaces_updated
+      bridge.ringBuffer.length = 0;
+      const editNoteRes = await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${convId}/flag`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ flagged: true, flagNote: 'Verify on device first' }),
+      });
+      assert.equal(editNoteRes.status, 200);
+      const editNoteJson = await editNoteRes.json();
+      assert.equal(editNoteJson.flagNote, 'Verify on device first');
+      const wsEditEv = bridge.ringBuffer.find((e) => e.type === 'workspaces_updated');
+      assert.ok(wsEditEv, 'Editing flagNote must broadcast workspaces_updated');
+      const editedConv = wsEditEv.workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
+      assert.equal(editedConv?.flagNote, 'Verify on device first');
+
+      // Unflagging clears flagNote cleanly
       bridge.ringBuffer.length = 0;
       const unflagRes = await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${convId}/flag`, {
         method: 'POST',
@@ -1393,11 +1522,13 @@ test('BridgeServer persists conversation to-do flag and broadcasts workspaces_up
       assert.equal(unflagRes.status, 200);
       const unflagJson = await unflagRes.json();
       assert.equal(unflagJson.flagged, false);
+      assert.equal(unflagJson.flagNote, null);
 
       const wsUnflagEv = bridge.ringBuffer.find((e) => e.type === 'workspaces_updated');
       assert.ok(wsUnflagEv, 'Unflagging must broadcast workspaces_updated');
       const unflaggedConv = wsUnflagEv.workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
       assert.equal(unflaggedConv?.flagged, false);
+      assert.equal(unflaggedConv?.flagNote, null);
     } finally {
       await bridge.stop();
     }
@@ -1881,6 +2012,207 @@ test('Desktop stream-interrupted cancel clears thinking state immediately withou
       else process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR = prevExecDir;
       if (prevLsAddr === undefined) delete process.env.ANTIGRAVITY_LS_ADDRESS;
       else process.env.ANTIGRAVITY_LS_ADDRESS = prevLsAddr;
+    }
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+
+test('Step-index read cursor and completion mtime guarantee hasUnread=true on flagged/regular sessions even when PLANNER_RESPONSE.created_at precedes iosViewedMs', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-step-unread-'));
+  try {
+    const appData = join(sandbox, 'antigravity');
+    const stateDir = join(sandbox, 'state');
+    const annDir = join(appData, 'annotations');
+    mkdirSync(annDir, { recursive: true });
+
+    const convId = 'f1f1f1f1-1111-4222-8333-444444444444';
+    const logDir = join(appData, 'brain', convId, '.system_generated', 'logs');
+    mkdirSync(logDir, { recursive: true });
+    const tPath = join(logDir, 'transcript.jsonl');
+
+    const nowMs = Date.now();
+    const turn1Sec = Math.floor((nowMs - 60_000) / 1000);
+    writeFileSync(
+      join(annDir, `${convId}.pbtxt`),
+      `title:"Flagged Task Session" last_user_view_time:{seconds:${turn1Sec + 5} nanos:0}\n`,
+      'utf-8'
+    );
+    const turn1Lines = [
+      JSON.stringify({
+        step_index: 132,
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: new Date((turn1Sec - 5) * 1000).toISOString(),
+        content: '<USER_REQUEST>\n检查一下日志\n</USER_REQUEST>',
+      }),
+      JSON.stringify({
+        step_index: 133,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: new Date(turn1Sec * 1000).toISOString(),
+        content: '日志查完了，一切正常。',
+      }),
+    ];
+    writeFileSync(tPath, `${turn1Lines.join('\n')}\n`, 'utf-8');
+
+    const metaStore = new MetaStore({ stateDir });
+    const scanner = new BrainScanner({ appDataDirs: [appData], metaStore });
+    const bridge = new BridgeServer({
+      port: 0,
+      host: '127.0.0.1',
+      metaStore,
+      brainScanner: scanner,
+      agentController: {
+        isAvailable: () => true,
+        sendMessage: async () => ({ ok: true, mode: 'mock' }),
+      },
+      apnsPusher: new ApnsPusher({ metaStore, sendFn: async () => ({ sent: false }) }),
+      pollIntervalMs: 60_000,
+    });
+    await bridge.start();
+    const port = bridge.getBoundPort();
+    const token = metaStore.getToken();
+
+    try {
+      // 1. Flag the conversation & mark Turn 1 read on iOS
+      await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${convId}/flag`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ flagged: true }),
+      });
+      await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${convId}/read`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      // 2. User sends a new message from iOS; Bridge marks viewed while Step 133 is still latest.
+      //    Turn 2 starts 15s BEFORE completion so `PLANNER_RESPONSE.created_at` is strictly older
+      //    than both `iosViewedMs` and Desktop turn-start view time!
+      const turn2StartSec = Math.floor(Date.now() / 1000) - 15;
+      await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${convId}/messages`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: '那现在需要做什么？', clientMessageId: 'ios-turn2' }),
+      });
+      metaStore.markConversationViewed(
+        convId,
+        turn2StartSec * 1000 + 2500,
+        scanner.getConversationReadCursor(convId)
+      );
+      writeFileSync(
+        join(annDir, `${convId}.pbtxt`),
+        `title:"Flagged Task Session" last_user_view_time:{seconds:${turn2StartSec + 1} nanos:0}\n`,
+        'utf-8'
+      );
+
+      // 3. Antigravity flushes Step 137 with `created_at` stamped at TURN START (`turn2StartSec`),
+      //    while `mtimeMs` is NOW (15 seconds later).
+      const turn2Lines = [
+        ...turn1Lines,
+        JSON.stringify({
+          step_index: 134,
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          status: 'DONE',
+          created_at: new Date(turn2StartSec * 1000).toISOString(),
+          content: '<USER_REQUEST>\n那现在需要做什么？\n</USER_REQUEST>',
+        }),
+        JSON.stringify({
+          step_index: 137,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: new Date(turn2StartSec * 1000).toISOString(),
+          content: '就两步，简单到闭着眼都能走完。',
+        }),
+      ];
+      writeFileSync(tPath, `${turn2Lines.join('\n')}\n`, 'utf-8');
+      await fetch(`http://127.0.0.1:${port}/internal/hook`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-AntigravityZ-Hook-Secret': metaStore.getHookSecret(),
+        },
+        body: JSON.stringify({
+          hookEventName: 'Stop',
+          conversationId: convId,
+          continuationActive: false,
+        }),
+      });
+      await new Promise((r) => setTimeout(r, 80));
+      await bridge.pollChanges();
+
+      const bootUnread = await (
+        await fetch(`http://127.0.0.1:${port}/api/v1/bootstrap`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ).json();
+      const convUnread = bootUnread.workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
+      assert.ok(convUnread, 'Expected flagged conversation in bootstrap');
+      assert.equal(convUnread.flagged, true, 'Conversation must remain flagged');
+      assert.equal(
+        convUnread.hasUnread,
+        true,
+        'Flagged conversation MUST show hasUnread=true even when PLANNER_RESPONSE.created_at precedes iosViewedMs & Desktop start view!'
+      );
+
+      // 4. Opening / reading the conversation on iOS clears hasUnread while keeping flagged=true
+      await fetch(`http://127.0.0.1:${port}/api/v1/conversations/${convId}/read`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const bootRead = await (
+        await fetch(`http://127.0.0.1:${port}/api/v1/bootstrap`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ).json();
+      const convRead = bootRead.workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
+      assert.equal(convRead.flagged, true, 'Flag must persist after reading');
+      assert.equal(convRead.hasUnread, false, '/read must advance stepIndex cursor to 137 and clear hasUnread');
+
+      // 5. Same-step streaming growth (Step 137 gains more text after user left) also triggers hasUnread=true
+      const grownLines = [
+        ...turn2Lines.slice(0, -1),
+        JSON.stringify({
+          step_index: 137,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: new Date(turn2StartSec * 1000).toISOString(),
+          content: '就两步，简单到闭着眼都能走完。补充：第一步推上线，第二步回归验证。',
+        }),
+      ];
+      writeFileSync(tPath, `${grownLines.join('\n')}\n`, 'utf-8');
+      await bridge.pollChanges();
+      const bootGrown = await (
+        await fetch(`http://127.0.0.1:${port}/api/v1/bootstrap`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ).json();
+      const convGrown = bootGrown.workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
+      assert.equal(convGrown.hasUnread, true, 'Same-step content growth after read must re-trigger hasUnread=true');
+
+      // 6. Viewing on Desktop AFTER completion clears hasUnread even without iOS /read
+      const afterCompleteSec = Math.ceil(Date.now() / 1000) + 5;
+      writeFileSync(
+        join(annDir, `${convId}.pbtxt`),
+        `title:"Flagged Task Session" last_user_view_time:{seconds:${afterCompleteSec} nanos:0}\n`,
+        'utf-8'
+      );
+      await bridge.pollChanges();
+      const bootDesktopRead = await (
+        await fetch(`http://127.0.0.1:${port}/api/v1/bootstrap`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ).json();
+      const convDesktopRead = bootDesktopRead.workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
+      assert.equal(convDesktopRead.hasUnread, false, 'Desktop view after reply completion must clear hasUnread');
+    } finally {
+      await bridge.stop();
     }
   } finally {
     rmSync(sandbox, { recursive: true, force: true });

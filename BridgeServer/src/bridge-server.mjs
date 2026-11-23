@@ -138,6 +138,7 @@ function fingerprintSummary(conv) {
     conv.title,
     conv.pinned ? '1' : '0',
     conv.flagged ? '1' : '0',
+    conv.flagNote || '',
     conv.hasUnread ? '1' : '0',
     conv.currentModelId || '',
     conv.sessionMode || 'agent',
@@ -393,7 +394,7 @@ export class BridgeServer {
 
       const archivedList = scan.archivedConversations || [];
       const archivedFp = archivedList
-        .map((c) => `${c.id}:${c.title}:${c.updatedMs}:${c.lastPreview}:${c.flagged ? '1' : '0'}`)
+        .map((c) => `${c.id}:${c.title}:${c.updatedMs}:${c.lastPreview}:${c.flagged ? '1' : '0'}:${c.flagNote || ''}`)
         .join('|');
       if (this.lastArchivedFingerprint !== null && this.lastArchivedFingerprint !== archivedFp) {
         listChanged = true;
@@ -517,6 +518,14 @@ export class BridgeServer {
       chunks.push(chunk);
     }
     return total === 0 ? Buffer.alloc(0) : Buffer.concat(chunks);
+  }
+
+  #markConversationViewed(convId, viewedMs = Date.now()) {
+    if (!convId || !this.metaStore?.markConversationViewed) return 0;
+    const cursor = this.brainScanner?.getConversationReadCursor
+      ? this.brainScanner.getConversationReadCursor(String(convId))
+      : null;
+    return this.metaStore.markConversationViewed(String(convId), viewedMs, cursor);
   }
 
   async #handleHttp(req, res) {
@@ -740,8 +749,8 @@ export class BridgeServer {
           active: isActive,
           visibleConversationId: visibleConvId,
         });
-        if (isActive && visibleConvId && this.metaStore?.markConversationViewed) {
-          this.metaStore.markConversationViewed(String(visibleConvId), Date.now());
+        if (isActive && visibleConvId) {
+          this.#markConversationViewed(String(visibleConvId), Date.now());
         }
         this.#sendJson(res, 200, { ok: true });
         return;
@@ -838,7 +847,7 @@ export class BridgeServer {
             model: body.model || '',
             mode: body.mode || 'agent',
           });
-          this.metaStore.markConversationViewed(result.conversationId, Date.now());
+          this.#markConversationViewed(result.conversationId, Date.now());
           this.metaStore.addPendingMessage(result.conversationId, {
             clientMessageId: result.clientMessageId,
             text: String(body.prompt || '').trim() || (result.attachments?.length ? `请查看附件：${result.attachments.map((a) => a.name).join('、')}` : ''),
@@ -888,7 +897,7 @@ export class BridgeServer {
       const markReadMatch = /^\/api\/v1\/conversations\/([0-9a-zA-Z_-]{6,64})\/read$/.exec(pathname);
       if (req.method === 'POST' && markReadMatch) {
         const convId = markReadMatch[1];
-        const viewedMs = this.metaStore.markConversationViewed(convId, Date.now());
+        const viewedMs = this.#markConversationViewed(convId, Date.now());
         await this.pollChanges();
         this.#sendJson(res, 200, {
           ok: true,
@@ -899,18 +908,24 @@ export class BridgeServer {
         return;
       }
 
-      // Toggle conversation to-do flag (synced across paired mobile devices): POST /api/v1/conversations/:id/flag
+      // Toggle conversation to-do flag & optional note (synced across paired mobile devices): POST /api/v1/conversations/:id/flag
       const flagMatch = /^\/api\/v1\/conversations\/([0-9a-zA-Z_-]{6,64})\/flag$/.exec(pathname);
       if (req.method === 'POST' && flagMatch) {
         const convId = flagMatch[1];
         const body = await this.#readJsonBody(req);
         const nextFlagged = Boolean(body.flagged);
-        const meta = this.metaStore.setConversationFlagged(convId, nextFlagged);
+        const hasNoteField = Object.prototype.hasOwnProperty.call(body, 'flagNote');
+        const meta = this.metaStore.setConversationFlagged(
+          convId,
+          nextFlagged,
+          hasNoteField ? body.flagNote : undefined
+        );
         await this.pollChanges();
         this.#sendJson(res, 200, {
           ok: true,
           conversationId: convId,
           flagged: Boolean(meta?.flagged),
+          flagNote: meta?.flagged && meta?.flagNote ? meta.flagNote : null,
         }, req);
         return;
       }
@@ -919,7 +934,7 @@ export class BridgeServer {
       const sendMsgMatch = /^\/api\/v1\/conversations\/([0-9a-zA-Z_-]{6,64})\/messages$/.exec(pathname);
       if (req.method === 'POST' && sendMsgMatch) {
         const convId = sendMsgMatch[1];
-        this.metaStore.markConversationViewed(convId, Date.now());
+        this.#markConversationViewed(convId, Date.now());
         const body = await this.#readJsonBody(req);
         const text = String(body.text || body.prompt || '').trim();
         const clientMessageId = String(body.clientMessageId || `ios-${randomUUID()}`);
@@ -1264,7 +1279,7 @@ export class BridgeServer {
               visibleConversationId: visibleConvId,
             });
             if (isActive && visibleConvId && this.metaStore?.markConversationViewed) {
-              this.metaStore.markConversationViewed(String(visibleConvId), Date.now());
+              this.#markConversationViewed(String(visibleConvId), Date.now());
             }
           }
         } catch {
