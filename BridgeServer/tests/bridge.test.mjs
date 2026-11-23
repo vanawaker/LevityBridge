@@ -71,7 +71,7 @@ test('QuotaMonitor parses GetUserStatus model quota pools and reset times', () =
 });
 
 test('QR SVG generator produces valid crisp SVG for pairing URIs', () => {
-  const uri = 'antigravityz://pair?url=http%3A%2F%2F100.108.180.5%3A19818&token=abc123XYZ_secretToken987654&name=StudioMac';
+  const uri = 'antigravityz://pair?url=http%3A%2F%2F100.64.0.10%3A19818&token=abc123XYZ_secretToken987654&name=StudioMac';
   const svg = generateQrSvg(uri);
   assert.ok(svg.startsWith('<svg xmlns="http://www.w3.org/2000/svg"'));
   assert.ok(svg.includes('<path d="M'));

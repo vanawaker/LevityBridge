@@ -16,10 +16,18 @@ const sidecarEntryPath = path.join(repoRoot, 'BridgeServer', 'src', 'sidecar-ent
 fs.mkdirSync(path.join(pluginDir, 'assets'), { recursive: true });
 fs.mkdirSync(path.join(pluginDir, 'sidecars', 'bridge'), { recursive: true });
 
+const pkgVersion = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version || '1.0.5';
+  } catch {
+    return '1.0.5';
+  }
+})();
+
 const pluginManifest = {
   name: 'levity-bridge',
   displayName: 'LevityBridge',
-  version: '1.0.2',
+  version: pkgVersion,
   description:
     'Open-source companion bridge plugin syncing Antigravity desktop sessions with Levity on iPhone, iPad, and iPhone Duo over LAN or Tailscale.',
   author: {

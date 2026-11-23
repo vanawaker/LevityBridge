@@ -32,13 +32,19 @@ npm run install-plugin
 
 Then restart Antigravity (or enable **LevityBridge** in **Customizations → Plugins**), open the **Levity** sidecar panel, and scan the QR code from **Levity** on your iPhone or iPad.
 
+To update an existing install later:
+
+```bash
+git -C ~/LevityBridge pull --ff-only && npm --prefix ~/LevityBridge run install-plugin
+```
+
 ## Features
 
 - **Zero External Dependencies**: Runs purely on Node.js (`>= 20`) built-in modules (`http`, `http2`, `crypto`, `zlib`, `fs`, `node:sqlite`).
 - **Official Plugin Lifecycle**: Integrates cleanly via Antigravity Sidecar + Hooks (`SessionStart`, `PreInvocation`, `PreToolUse`, `PostToolUse`, `PostInvocation`, `Stop`).
 - **Local-First & Private**: Sessions, thumbnails, and uploaded files travel directly between your Mac and your iOS/iPadOS device over LAN, Tailscale, or your private network. No cloud conversation storage.
 - **Fast on Cellular**: Built-in tail pagination, HTTP Gzip compression, and cached thumbnail resizing (`sips` on macOS).
-- **Instant Choice-Prompt & Completion Push**: Immediately alerts your phone the moment your Agent asks a choice question or finishes a turn, with dual-synced unread clearing (`LEVITY_PUSH_RELAY_URL=off` disables push relay completely).
+- **Smart Final-Reply & Choice-Prompt Push**: Immediately alerts your phone when your Agent asks a choice question or finishes its final reply — while silencing intermediate background-command and subagent status noise — complete with dual-synced unread clearing and cross-device To-Do flagging (`LEVITY_PUSH_RELAY_URL=off` disables push relay completely).
 
 ## Scope & Current Limitations
 

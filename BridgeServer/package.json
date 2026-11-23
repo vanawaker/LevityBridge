@@ -1,9 +1,9 @@
 {
-  "name": "antigravityz-bridge",
-  "version": "0.1.0",
+  "name": "levity-bridge-server",
+  "version": "1.0.5",
   "private": true,
   "type": "module",
-  "description": "Official Antigravity 2.0 Sidecar & Native iOS Bridge for AntigravityZ",
+  "description": "Zero-dependency Antigravity Sidecar & Native iOS/iPadOS Bridge Server for Levity",
   "scripts": {
     "start": "node src/standalone.mjs",
     "sidecar": "node src/sidecar-entry.mjs",

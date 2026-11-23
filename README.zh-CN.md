@@ -32,13 +32,19 @@ npm run install-plugin
 
 安装完成后重启 Antigravity（或在 **Customizations → Plugins** 启用 **LevityBridge**），打开 **Levity** 侧栏面板扫码即可秒连。
 
+后续升级到最新版本只需一行命令：
+
+```bash
+git -C ~/LevityBridge pull --ff-only && npm --prefix ~/LevityBridge run install-plugin
+```
+
 ## 核心特性
 
 - **零第三方依赖**：纯 Node.js（`>= 20`）原生模块实现，安全可审计。
 - **标准插件架构**：基于 Antigravity 官方 Sidecar 侧栏与生命周期 Hooks 接入，支持二维码一键配对与实时会话同步。
 - **本地直连保护隐私**：所有聊天记录、附件与配对凭据仅在你的电脑与移动设备间通过局域网或 Tailscale 等私有网络直连传输，不经过开发者云端存储。
 - **蜂窝网络极速体验**：内置尾部按需分页、HTTP Gzip 压缩与缩略图缓存。
-- **选择题与回复即时推送**：Agent 弹出选项提问或完成任务瞬间即可推送到手机，双端自动同步已读状态（若希望彻底关闭外部中转，设置 `LEVITY_PUSH_RELAY_URL=off` 即可）。
+- **智能终态推送与跨端标旗**：仅在 Agent 弹出选项提问或完成最终回答时第一时间推送到手机（自动过滤后台命令与子代理运行中的中间噪音），并支持双端已读消灯与待办旗标跨设备同步（设置 `LEVITY_PUSH_RELAY_URL=off` 可彻底关闭外部推送中转）。
 
 ## 定位与已知局限
 
