@@ -375,14 +375,19 @@ export class AgentController {
     args.push('--', fullPrompt);
 
     // Explicitly target Desktop's native `outside-of-project` (or a matching user Project ID)
-    // instead of inheriting the sidecar's auto-created hidden project (`ANTIGRAVITY_PROJECT_ID`),
-    // and never fall back to the plugin's own sidecar directory as `cwd`.
+    // and strip sidecar-origin metadata (`ANTIGRAVITY_SOURCE_METADATA`, etc.) so conversations
+    // created from mobile are first-class user sessions that appear cleanly in Antigravity's
+    // official Desktop & Web sidebars instead of being filtered out as sidecar-internal chats!
     const targetProjectId = this.resolveDesktopProjectIdForWorkspace(resolvedWorkspace);
     const cwd = resolvedWorkspace && existsSync(resolvedWorkspace) ? resolvedWorkspace : homedir();
     const env = {
       ...process.env,
       ANTIGRAVITY_PROJECT_ID: targetProjectId,
     };
+    delete env.ANTIGRAVITY_SOURCE_METADATA;
+    delete env.ANTIGRAVITY_SIDECAR_UI_TOKEN;
+    delete env.ANTIGRAVITY_SIDECAR_WEB_PORT;
+    delete env.ANTIGRAVITY_EXECUTABLE_DATA_DIR;
     const { stdout, stderr } = await this.execFn(this.agentApiPath, args, {
       cwd,
       env,

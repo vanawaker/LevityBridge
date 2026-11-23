@@ -648,14 +648,18 @@ export class BrainScanner {
 
     let activity = prev.activity || 'idle';
     let detail = prev.detail || '';
+    let stoppedAt = prev.stoppedAt || 0;
+    let continuationActive = false;
     if (hookName === 'SessionStart') {
       this.inFlightTools.delete(convId);
       activity = 'thinking';
       detail = '思考中…';
+      stoppedAt = 0;
     } else if (hookName === 'PreInvocation') {
       this.inFlightTools.delete(convId);
       activity = 'thinking';
       detail = '思考中…';
+      stoppedAt = 0;
     } else if (hookName === 'PreToolUse') {
       const args = toolCall?.args || toolCall?.arguments || payload?.toolInput || payload?.tool_input || {};
       const clean = (v) => String(v ?? '').replace(/^"|"$/g, '');
@@ -675,18 +679,23 @@ export class BrainScanner {
       });
       activity = askQuestion ? 'waiting' : 'working';
       detail = askQuestion ? '等待你的确认…' : humanizeToolActivity(toolName || 'tool', args);
+      stoppedAt = 0;
     } else if (hookName === 'PostToolUse') {
       this.inFlightTools.delete(convId);
       activity = 'thinking';
       detail = '思考中…';
+      stoppedAt = 0;
     } else if (hookName === 'PostInvocation') {
       this.inFlightTools.delete(convId);
       activity = 'working';
       detail = '正在回复…';
+      stoppedAt = 0;
     } else if (hookName === 'Stop') {
       this.inFlightTools.delete(convId);
       activity = 'idle';
       detail = '';
+      stoppedAt = Date.now();
+      continuationActive = Boolean(payload?.continuationActive);
     }
 
     const entry = {
@@ -697,6 +706,8 @@ export class BrainScanner {
       toolName,
       workspacePaths,
       modelName: payload.modelName || prev.modelName || null,
+      stoppedAt,
+      continuationActive,
       updatedAt: Date.now(),
     };
     this.liveHooks.set(convId, entry);
@@ -1006,6 +1017,7 @@ export class BrainScanner {
           lastPreview = `[图片] ${assistantAtts.map((a) => a.name).join('、')}`.slice(0, 140);
         }
 
+        const isTurnFinal = mappedTools.length === 0 && (Boolean(content) || assistantAtts.length > 0);
         const assistantItem = {
           id: `step-${stepIdx}`,
           stepIndex: stepIdx,
@@ -1015,6 +1027,7 @@ export class BrainScanner {
           thinking: thinking || null,
           toolCalls: mappedTools,
           attachments: assistantAtts,
+          isTurnFinal,
           createdAt,
         };
         items.push(assistantItem);
@@ -1093,6 +1106,7 @@ export class BrainScanner {
         if (Array.isArray(item.attachments) && item.attachments.length > 0) {
           prev.attachments = [...(prev.attachments || []), ...item.attachments];
         }
+        prev.isTurnFinal = Boolean(item.isTurnFinal);
         prev.stepIndex = item.stepIndex;
         prev.createdAt = item.createdAt || prev.createdAt;
       } else {
@@ -1456,11 +1470,41 @@ export class BrainScanner {
 
     const hook = this.liveHooks.get(convId);
     const now = Date.now();
-    if (hook && now - hook.updatedAt < 90_000 && hook.activity !== 'idle') {
+    const lastItem = parsedTranscript.items[parsedTranscript.items.length - 1];
+    const lastItemMs = lastItem?.createdAt ? Date.parse(lastItem.createdAt) || 0 : 0;
+
+    // If Desktop cancelled/interrupted generation (writing an ERROR_MESSAGE like
+    // "Error: The stream was interrupted...") or finished a turn-final reply / flipped SQLite
+    // explicitly back to IDLE AFTER the last active hook WITHOUT firing a `Stop` hook,
+    // expire the stale live hook immediately instead of hanging in `思考中…` for 90s!
+    const hookInvalidatedByTerminalTranscript = Boolean(
+      hook &&
+      hook.activity !== 'idle' &&
+      (
+        (lastItem?.role === 'error' && (lastItemMs >= hook.updatedAt - 1000 || parsedTranscript.mtimeMs >= hook.updatedAt)) ||
+        (lastItem?.role === 'assistant' && lastItem.isTurnFinal && lastItemMs > hook.updatedAt + 500 && dbEntry?.status === 'CASCADE_RUN_STATUS_IDLE' && !dbEntry?.notFullyIdle) ||
+        (dbEntry?.status === 'CASCADE_RUN_STATUS_IDLE' && !dbEntry?.notFullyIdle && dbEntry?.modifiedMs > hook.updatedAt + 800 && !parsedTranscript.hasPendingBackgroundTasks)
+      )
+    );
+    if (hookInvalidatedByTerminalTranscript) {
+      this.inFlightTools.delete(convId);
+      this.liveHooks.set(convId, {
+        ...hook,
+        hookEventName: 'Stop',
+        continuationActive: false,
+        activity: 'idle',
+        detail: '',
+        stoppedAt: now,
+        updatedAt: now,
+      });
+    }
+
+    const effectiveHook = this.liveHooks.get(convId);
+    if (effectiveHook && now - effectiveHook.updatedAt < 90_000 && effectiveHook.activity !== 'idle') {
       return {
         state: 'running',
-        activity: hook.activity,
-        detail: hook.detail || '思考中…',
+        activity: effectiveHook.activity,
+        detail: effectiveHook.detail || '思考中…',
       };
     }
     if (parsedTranscript.hasPendingBackgroundTasks) {
@@ -1474,15 +1518,31 @@ export class BrainScanner {
         detail: detailMsg,
       };
     }
-    if (dbEntry && (dbEntry.status === 'CASCADE_RUN_STATUS_RUNNING' || dbEntry.notFullyIdle)) {
+
+    const hasNewerUserTurnAfterStop =
+      Boolean(effectiveHook?.stoppedAt) &&
+      lastItem?.role === 'user' &&
+      lastItemMs > effectiveHook.stoppedAt + 200;
+    // Antigravity fires the `Stop` hook synchronously BEFORE SQLite flips
+    // `conversation_summaries.status` / `not_fully_idle` back to idle (often 1–5s later).
+    // Trust a recent non-continuation `Stop` hook (or terminal error/interrupt step) over stale
+    // SQLite running flags so `runState`, `lastPreview`, and `hasUnread` flip atomically!
+    const hasAuthoritativeRecentStop =
+      (
+        (Boolean(effectiveHook && effectiveHook.hookEventName === 'Stop' && !effectiveHook.continuationActive) &&
+          now - effectiveHook.updatedAt < 15_000) ||
+        hookInvalidatedByTerminalTranscript
+      ) &&
+      !hasNewerUserTurnAfterStop;
+
+    if (!hasAuthoritativeRecentStop && dbEntry && (dbEntry.status === 'CASCADE_RUN_STATUS_RUNNING' || dbEntry.notFullyIdle)) {
       return {
         state: 'running',
         activity: 'thinking',
         detail: '思考中…',
       };
     }
-    if (parsedTranscript.mtimeMs && now - parsedTranscript.mtimeMs < 25_000) {
-      const lastItem = parsedTranscript.items[parsedTranscript.items.length - 1];
+    if (!hasAuthoritativeRecentStop && parsedTranscript.mtimeMs && now - parsedTranscript.mtimeMs < 25_000) {
       if (lastItem && (lastItem.role === 'user' || (lastItem.role === 'assistant' && !lastItem.content))) {
         return {
           state: 'running',
@@ -1491,8 +1551,11 @@ export class BrainScanner {
         };
       }
     }
-    const lastItem = parsedTranscript.items[parsedTranscript.items.length - 1];
     if (lastItem?.role === 'error') {
+      const isStreamInterrupted = /stream was interrupted|user_canceled|cancelled|canceled/i.test(lastItem.content || '');
+      if (isStreamInterrupted) {
+        return { state: 'idle', activity: 'idle', detail: '' };
+      }
       return { state: 'error', activity: 'error', detail: '执行出错' };
     }
     return { state: 'idle', activity: 'idle', detail: '' };
@@ -1663,27 +1726,45 @@ export class BrainScanner {
         meta,
       });
 
-      const updatedMs = c.parsed.mtimeMs || c.dirMtimeMs;
-      const updatedAt = c.parsed.lastTimestamp || new Date(updatedMs).toISOString();
+      const pendingMsgs = this.metaStore ? this.metaStore.getPendingMessages(c.id) : [];
+      const latestPending = pendingMsgs.length > 0 ? pendingMsgs[pendingMsgs.length - 1] : null;
       const pendingInteraction = this.resolvePendingInteraction(c.id, c.parsed, c.convDir);
       const runStatus = this.computeRunState(c.id, c.parsed, dbEntry, pendingInteraction);
+      const nowScanMs = Date.now();
+      let updatedMs = c.parsed.mtimeMs || c.dirMtimeMs;
+      let effectivePreview = c.parsed.lastPreview || '暂无消息';
+      if (latestPending && latestPending.sentAt > updatedMs) {
+        updatedMs = latestPending.sentAt;
+        if (latestPending.text) {
+          effectivePreview = String(latestPending.text).replace(/\s+/g, ' ').slice(0, 140);
+        }
+      }
+      if (runStatus.state === 'running' && hook && hook.activity !== 'idle' && nowScanMs - hook.updatedAt < 90_000) {
+        updatedMs = Math.max(updatedMs, hook.updatedAt);
+      }
+      const updatedAt = c.parsed.lastTimestamp && updatedMs === c.parsed.mtimeMs
+        ? c.parsed.lastTimestamp
+        : new Date(updatedMs).toISOString();
       const modelAndMode = this.resolveModelAndMode(c.id, c.parsed);
       const pinned = Boolean(dbEntry?.pinned);
       const archived = Boolean(dbEntry?.archived);
       const flagged = Boolean(savedMeta?.flagged);
       const desktopViewedMs = dbEntry?.lastUserViewMs || 0;
       const iosViewedMs = savedMeta?.iosViewedMs || 0;
-      const lastViewedMs = Math.max(desktopViewedMs, iosViewedMs);
+      const viewedThresholdMs = Math.max(
+        desktopViewedMs > 0 ? desktopViewedMs + 1500 : 0,
+        iosViewedMs > 0 ? iosViewedMs + 250 : 0
+      );
       const lastReplyMs = c.parsed.lastAssistantReplyMs || 0;
       let hasUnread = false;
       if (!archived && runStatus.state !== 'running') {
         if (pendingInteraction) {
           hasUnread = true;
         } else if (lastReplyMs > 0) {
-          if (lastViewedMs > 0) {
-            hasUnread = lastReplyMs > lastViewedMs + 1500;
+          if (viewedThresholdMs > 0) {
+            hasUnread = lastReplyMs > viewedThresholdMs;
           } else {
-            hasUnread = Date.now() - lastReplyMs < 6 * 3600 * 1000;
+            hasUnread = nowScanMs - lastReplyMs < 6 * 3600 * 1000;
           }
         }
       }
@@ -1702,7 +1783,7 @@ export class BrainScanner {
         parentConversationId: parentId || null,
         isSubagent,
         subagentRole: meta?.subagentSpec?.role || null,
-        lastPreview: c.parsed.lastPreview || '暂无消息',
+        lastPreview: effectivePreview,
         stepCount: c.parsed.stepCount,
         messageCount: c.parsed.items.length,
         artifactCount: c.artifacts.length,

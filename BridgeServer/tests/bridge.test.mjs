@@ -1596,3 +1596,293 @@ test('Stop hook suppresses mid-task notifications while background command/subag
     rmSync(sandbox, { recursive: true, force: true });
   }
 });
+
+test('Stop hook beats stale SQLite not_fully_idle and emits atomic workspaces_updated (idle+preview+unread) BEFORE notification_event, plus tags isTurnFinal accurately', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-atomic-stop-'));
+  try {
+    const appDataDir = join(sandbox, 'antigravity');
+    const brainRoot = join(appDataDir, 'brain');
+    const convId = 'b2b2b2b2-1111-4222-8333-444444444444';
+    const logsDir = join(brainRoot, convId, '.system_generated', 'logs');
+    const annDir = join(appDataDir, 'annotations');
+    mkdirSync(logsDir, { recursive: true });
+    mkdirSync(annDir, { recursive: true });
+
+    const nowMs = Date.now();
+    const viewedSec = Math.floor((nowMs - 60_000) / 1000);
+    writeFileSync(
+      join(annDir, `${convId}.pbtxt`),
+      `title: "SuperG · 超级小 G"\nlast_user_view_time {\n  seconds: ${viewedSec}\n  nanos: 0\n}\n`
+    );
+
+    // SQLite deliberately stays STALE (`CASCADE_RUN_STATUS_RUNNING`, `not_fully_idle = 1`)
+    // even after the Stop hook fires — reproducing Antigravity's real SQLite flush lag!
+    const db = new DatabaseSync(join(appDataDir, 'conversation_summaries.db'));
+    db.exec(`
+      CREATE TABLE conversation_summaries (
+        conversation_id TEXT PRIMARY KEY,
+        title TEXT,
+        workspace_uris TEXT,
+        project_id TEXT,
+        status TEXT,
+        parent_conversation_id TEXT,
+        nesting_depth INTEGER,
+        not_fully_idle INTEGER,
+        killed INTEGER,
+        last_modified_time TEXT
+      );
+    `);
+    db.prepare(
+      `INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      convId,
+      'SuperG · 超级小 G',
+      '',
+      'outside-of-project',
+      'CASCADE_RUN_STATUS_RUNNING',
+      '',
+      0,
+      1,
+      0,
+      new Date(nowMs - 1000).toISOString()
+    );
+    db.close();
+
+    // Transcript with:
+    // 1. User prompt
+    // 2. Intermediate progress commentary WITH tool_calls (`isTurnFinal` MUST be false)
+    // 3. Final reply #1 WITHOUT tool_calls (`isTurnFinal` MUST be true, 14:08)
+    // 4. Background task completion SYSTEM_MESSAGE -> follow-up reply #2 WITHOUT tool_calls (`isTurnFinal` MUST be true, 14:11)
+    const tPath = join(logsDir, 'transcript_full.jsonl');
+    const t1 = new Date(nowMs - 20_000).toISOString();
+    const t2 = new Date(nowMs - 18_000).toISOString();
+    const t3 = new Date(nowMs - 15_000).toISOString();
+    const t4 = new Date(nowMs - 12_000).toISOString();
+    const t5 = new Date(nowMs - 2_000).toISOString();
+    const t6 = new Date(nowMs - 500).toISOString();
+    writeFileSync(
+      tPath,
+      [
+        JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', content: '查一下安卓端有没有同样的坑', created_at: t1 }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          content: '我先搜一下全仓正则用法…',
+          tool_calls: [{ id: 'tc-1', name: 'read_file', args: { Path: '/tmp/AppModel.kt' } }],
+          created_at: t2,
+        }),
+        JSON.stringify({ step_index: 2, type: 'GENERIC', status: 'DONE', content: 'ok', created_at: t3 }),
+        JSON.stringify({
+          step_index: 3,
+          type: 'PLANNER_RESPONSE',
+          content: '拍个板，你说「开搞」我马上动手！',
+          tool_calls: [],
+          created_at: t4,
+        }),
+        JSON.stringify({
+          step_index: 4,
+          type: 'SYSTEM_MESSAGE',
+          content: 'Task id "bg-search-1" finished with result: matched ChatCompactionTest.kt',
+          created_at: t5,
+        }),
+        JSON.stringify({
+          step_index: 5,
+          type: 'PLANNER_RESPONSE',
+          thinking: 'Investigating past task outputs...',
+          content: '刚后台那条全仓检索跑完了，顺手确认到安卓单测也一样！',
+          tool_calls: [],
+          created_at: t6,
+        }),
+      ].join('\n') + '\n'
+    );
+
+    const metaStore = new MetaStore(join(sandbox, 'meta'));
+    const scanner = new BrainScanner({ appDataDirs: [appDataDir], metaStore });
+    const fakeApns = {
+      isConfigured: () => true,
+      updatePresence: () => {},
+      notifyConversation: async () => ({ ok: true }),
+    };
+    const bridge = new BridgeServer({
+      port: 0,
+      host: '127.0.0.1',
+      metaStore,
+      brainScanner: scanner,
+      agentController: { isAvailable: () => false },
+      apnsPusher: fakeApns,
+      quotaMonitor: { getSnapshot: async () => null },
+      pollIntervalMs: 60_000,
+    });
+    await bridge.start();
+    try {
+      const port = bridge.getBoundPort();
+      // Initial baseline scan (before Stop, SQLite says RUNNING -> runState='running', hasUnread=false)
+      await bridge.pollChanges();
+      const emitted = [];
+      const origEmit = bridge.emitEvent.bind(bridge);
+      bridge.emitEvent = (type, payload) => {
+        const env = origEmit(type, payload);
+        emitted.push(env);
+        return env;
+      };
+
+      // Fire Stop hook while SQLite DB STILL says not_fully_idle = 1!
+      const stopRes = await fetch(`http://127.0.0.1:${port}/internal/hook`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-AntigravityZ-Hook-Secret': metaStore.getHookSecret(),
+        },
+        body: JSON.stringify({
+          hookEventName: 'Stop',
+          conversationId: convId,
+          continuationActive: false,
+        }),
+      });
+      assert.equal(stopRes.status, 200);
+      await new Promise((r) => setTimeout(r, 80));
+
+      const wsIdx = emitted.findIndex((e) => e.type === 'workspaces_updated');
+      const notifIdx = emitted.findIndex((e) => e.type === 'notification_event');
+      assert.ok(wsIdx >= 0, 'Expected atomic workspaces_updated event');
+      assert.ok(notifIdx > wsIdx, `Expected workspaces_updated (${wsIdx}) BEFORE notification_event (${notifIdx})`);
+
+      const updatedConv = emitted[wsIdx].workspaces
+        .flatMap((w) => w.conversations)
+        .find((c) => c.id === convId);
+      assert.ok(updatedConv, 'Expected conversation in workspaces_updated');
+      assert.equal(updatedConv.runState, 'idle', 'Stop hook must override stale SQLite not_fully_idle immediately');
+      assert.equal(updatedConv.hasUnread, true, 'Unread badge must flip true atomically in the same workspaces_updated');
+      assert.ok(updatedConv.lastPreview.includes('刚后台那条全仓检索跑完了'), 'Preview must already hold the latest reply');
+
+      // Verify isTurnFinal flags on parsed transcript items
+      const detail = await scanner.getConversationDetail(convId);
+      const assistantItems = detail.items.filter((it) => it.role === 'assistant');
+      assert.equal(assistantItems.length, 3);
+      assert.equal(assistantItems[0].isTurnFinal, false, 'Mid-turn tool commentary must have isTurnFinal = false');
+      assert.equal(assistantItems[1].isTurnFinal, true, 'First turn-ending reply (14:08) must have isTurnFinal = true');
+      assert.equal(assistantItems[2].isTurnFinal, true, 'Follow-up wakeup reply (14:11) must have isTurnFinal = true');
+    } finally {
+      await bridge.stop();
+    }
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test('Desktop stream-interrupted cancel clears thinking state immediately without Stop hook, and createConversation strips ANTIGRAVITY_SOURCE_METADATA', async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'agz-cancel-and-sidebar-'));
+  try {
+    // 1. Verify Desktop cancel (ERROR_MESSAGE: stream interrupted) immediately clears active PreInvocation hook
+    // even across repeated polls while SQLite not_fully_idle still lags!
+    const appDataDir = join(sandbox, 'antigravity');
+    const brainRoot = join(appDataDir, 'brain');
+    const convId = 'c3c3c3c3-1111-4222-8333-444444444444';
+    const logsDir = join(brainRoot, convId, '.system_generated', 'logs');
+    mkdirSync(logsDir, { recursive: true });
+
+    const nowMs = Date.now();
+    const db = new DatabaseSync(join(appDataDir, 'conversation_summaries.db'));
+    db.exec(`
+      CREATE TABLE conversation_summaries (
+        conversation_id TEXT PRIMARY KEY,
+        title TEXT,
+        workspace_uris TEXT,
+        project_id TEXT,
+        status TEXT,
+        parent_conversation_id TEXT,
+        nesting_depth INTEGER,
+        not_fully_idle INTEGER,
+        killed INTEGER,
+        last_modified_time TEXT
+      );
+    `);
+    db.prepare(
+      `INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      convId,
+      'Levity for Antigravity',
+      '',
+      'outside-of-project',
+      'CASCADE_RUN_STATUS_RUNNING',
+      '',
+      0,
+      1,
+      0,
+      new Date(nowMs - 1000).toISOString()
+    );
+    db.close();
+
+    const tPath = join(logsDir, 'transcript_full.jsonl');
+    writeFileSync(
+      tPath,
+      [
+        JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', content: '推吧', created_at: new Date(nowMs - 3000).toISOString() }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'ERROR_MESSAGE',
+          status: 'DONE',
+          source: 'SYSTEM',
+          content: 'Error: The stream was interrupted. Please continue the task you were working on.',
+          created_at: new Date(nowMs).toISOString(),
+        }),
+      ].join('\n') + '\n'
+    );
+
+    const metaStore = new MetaStore(join(sandbox, 'meta'));
+    const scanner = new BrainScanner({ appDataDirs: [appDataDir], metaStore });
+    scanner.recordHookEvent({ conversationId: convId, hookEventName: 'PreInvocation' });
+
+    // Poll #1 AND Poll #2 must BOTH report `idle` (never stuck in `思考中…` for 90s!)
+    const det1 = await scanner.getConversationDetail(convId);
+    assert.equal(det1.runState, 'idle', 'Stream interrupted must immediately exit running/thinking state');
+    assert.equal(det1.activityDetail, '');
+    const det2 = await scanner.getConversationDetail(convId);
+    assert.equal(det2.runState, 'idle', 'Second poll must stay idle even while SQLite not_fully_idle lags');
+
+    // 2. Verify AgentController.createConversation strips sidecar-origin env vars so new iOS sessions
+    // appear cleanly in official Desktop & Web Antigravity sidebars!
+    const prevSourceMeta = process.env.ANTIGRAVITY_SOURCE_METADATA;
+    const prevUiToken = process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN;
+    const prevWebPort = process.env.ANTIGRAVITY_SIDECAR_WEB_PORT;
+    const prevExecDir = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR;
+    const prevLsAddr = process.env.ANTIGRAVITY_LS_ADDRESS;
+    process.env.ANTIGRAVITY_SOURCE_METADATA = JSON.stringify({ sidecar: { sidecarId: 'antigravity-z/bridge' } });
+    process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN = 'secret-ui-token';
+    process.env.ANTIGRAVITY_SIDECAR_WEB_PORT = '63935';
+    process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR = '/tmp/fake-sidecar-data';
+    process.env.ANTIGRAVITY_LS_ADDRESS = 'localhost:65173';
+    try {
+      let capturedEnv = null;
+      const controller = new AgentController({
+        agentApiPath: 'mock-agentapi',
+        projectsRoot: sandbox,
+        execFn: async (_bin, _args, opts) => {
+          capturedEnv = opts.env;
+          return { stdout: JSON.stringify({ conversationId: 'd4d4d4d4-1111-4222-8333-444444444444' }), stderr: '' };
+        },
+      });
+      await controller.createConversation({ prompt: 'Hello from Levity' });
+      assert.ok(capturedEnv, 'Expected execFn to receive child env');
+      assert.equal(capturedEnv.ANTIGRAVITY_PROJECT_ID, 'outside-of-project');
+      assert.equal(capturedEnv.ANTIGRAVITY_LS_ADDRESS, 'localhost:65173');
+      assert.equal(capturedEnv.ANTIGRAVITY_SOURCE_METADATA, undefined, 'Must strip ANTIGRAVITY_SOURCE_METADATA so Web sidebar lists the session');
+      assert.equal(capturedEnv.ANTIGRAVITY_SIDECAR_UI_TOKEN, undefined);
+      assert.equal(capturedEnv.ANTIGRAVITY_SIDECAR_WEB_PORT, undefined);
+      assert.equal(capturedEnv.ANTIGRAVITY_EXECUTABLE_DATA_DIR, undefined);
+    } finally {
+      if (prevSourceMeta === undefined) delete process.env.ANTIGRAVITY_SOURCE_METADATA;
+      else process.env.ANTIGRAVITY_SOURCE_METADATA = prevSourceMeta;
+      if (prevUiToken === undefined) delete process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN;
+      else process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN = prevUiToken;
+      if (prevWebPort === undefined) delete process.env.ANTIGRAVITY_SIDECAR_WEB_PORT;
+      else process.env.ANTIGRAVITY_SIDECAR_WEB_PORT = prevWebPort;
+      if (prevExecDir === undefined) delete process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR;
+      else process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR = prevExecDir;
+      if (prevLsAddr === undefined) delete process.env.ANTIGRAVITY_LS_ADDRESS;
+      else process.env.ANTIGRAVITY_LS_ADDRESS = prevLsAddr;
+    }
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});

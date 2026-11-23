@@ -220,6 +220,8 @@ export class BridgeServer {
     this.httpServer = null;
     this.pollTimer = null;
     this.pingTimer = null;
+    this._pollPromise = null;
+    this._pollPending = false;
   }
 
   getPairingInfo() {
@@ -307,6 +309,24 @@ export class BridgeServer {
   }
 
   async pollChanges() {
+    if (this._pollPromise) {
+      this._pollPending = true;
+      return this._pollPromise;
+    }
+    this._pollPromise = (async () => {
+      try {
+        do {
+          this._pollPending = false;
+          await this.#runSinglePollChanges();
+        } while (this._pollPending);
+      } finally {
+        this._pollPromise = null;
+      }
+    })();
+    return this._pollPromise;
+  }
+
+  async #runSinglePollChanges() {
     try {
       const scan = await this.brainScanner.scanAll({ includeMetadata: false });
       this.lastUnreadCount = typeof scan.unreadCount === 'number' ? scan.unreadCount : 0;
@@ -569,6 +589,29 @@ export class BridgeServer {
         if (hookState) {
           this.emitEvent('live_activity', hookState);
           setImmediate(async () => {
+            if (hookName === 'Stop' && convId && !payload?.continuationActive) {
+              // Give Antigravity's transcript logger up to ~160ms to flush the final assistant
+              // text to `transcript_full.jsonl` (only when a recent active turn still tails on a
+              // user/empty step) before emitting the atomic list + toast snapshot, so clients
+              // NEVER see a toast ahead of the updated preview & unread badge!
+              const stopNowMs = Date.now();
+              for (let attempt = 0; attempt < 5; attempt += 1) {
+                const probe = await this.brainScanner.getConversationDetail(convId);
+                const realItems = (probe?.items || []).filter((it) => it.stepIndex !== 999999);
+                const tail = realItems[realItems.length - 1];
+                const tailMs = tail?.createdAt ? Date.parse(tail.createdAt) || 0 : 0;
+                const isRecentIncompleteTurn = tailMs > 0 && stopNowMs - tailMs < 300_000;
+                if (
+                  !tail ||
+                  !isRecentIncompleteTurn ||
+                  (tail.role === 'assistant' && (tail.content || (tail.attachments && tail.attachments.length > 0))) ||
+                  tail.role === 'error'
+                ) {
+                  break;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 35));
+              }
+            }
             if (hookName === 'Stop' || hookName === 'PostInvocation') {
               await this.quotaMonitor.getSnapshot({ force: true });
             }
@@ -908,6 +951,7 @@ export class BridgeServer {
           conversationId: convId,
           hookEventName: 'PreInvocation',
         });
+        await this.pollChanges();
         const detail = await this.brainScanner.getConversationDetail(convId);
         this.emitEvent('conversation_updated', {
           conversationId: convId,

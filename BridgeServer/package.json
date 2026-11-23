@@ -1,6 +1,6 @@
 {
   "name": "levity-bridge-server",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "private": true,
   "type": "module",
   "description": "Zero-dependency Antigravity Sidecar & Native iOS/iPadOS Bridge Server for Levity",
