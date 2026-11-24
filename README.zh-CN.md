@@ -5,6 +5,8 @@
 **LevityBridge** 是 **Levity**（iPhone / iPad / iPhone Duo 远程伴侣 App）的官方开源桌面端桥接插件。
 
 > Levity 与 LevityBridge 均为专为 Antigravity 打造的独立第三方伴侣工具，非 Google 官方产品。
+>
+> **平台支持：目前仅支持 macOS。** 作者手头没有 Windows / Linux 电脑没法实测，所以只适配并验证了 macOS。桥接代码本身是纯 Node.js 开源的，如果你用其他系统想折腾（或者直接丢给你的 Agent 自己研究改一版），随意发挥，真机测通的 PR 也欢迎来提。
 
 ---
 

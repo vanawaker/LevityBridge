@@ -5,6 +5,8 @@
 **LevityBridge** is the open-source companion desktop plugin for **Levity** on iPhone, iPad, and iPhone Duo.
 
 > Levity & LevityBridge are independent third-party companion tools for Antigravity, not affiliated with Google.
+>
+> **Platform Support: macOS only.** I don't have a Windows or Linux machine to test on, so `LevityBridge` is built and tested exclusively for macOS. The bridge is plain open-source Node.js though—if you're on another OS and want to hack on it (or hand the repo to your own Agent), feel free, and tested PRs are always welcome.
 
 ---
 
