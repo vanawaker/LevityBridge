@@ -13,6 +13,7 @@
       <div class="badge-row">
         <span class="dot" id="status-dot"></span>
         <span id="status-label">正在连接守护服务…</span>
+        <code id="bridge-version"></code>
       </div>
       <h1>LevityBridge</h1>
       <p class="subtitle">Levity Companion · Live Desktop Session Bridge</p>
@@ -45,6 +46,11 @@
         <span class="k">官方引擎</span>
         <span class="v" id="engine-status">检测中…</span>
       </div>
+      <div class="btn-row">
+        <button id="check-bridge-btn" class="btn ghost">检查桥接更新</button>
+        <button id="update-bridge-btn" class="btn primary" hidden>更新桥接</button>
+      </div>
+      <p class="qr-hint" id="bridge-update-feedback" role="status" hidden></p>
     </section>
   </main>
   <script src="/app.js"></script>

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -8,6 +10,7 @@ import { AgentController } from '../src/agent-controller.mjs';
 import { ApnsPusher } from '../src/apns-pusher.mjs';
 import { BrainScanner } from '../src/brain-scanner.mjs';
 import { BridgeServer } from '../src/bridge-server.mjs';
+import { BridgeUpdater, compareSemver } from '../src/bridge-updater.mjs';
 import { MetaStore } from '../src/meta-store.mjs';
 import { generateQrSvg } from '../src/qr-svg.mjs';
 import { QuotaMonitor } from '../src/quota-monitor.mjs';
@@ -107,7 +110,7 @@ function createReadCursorFixture(t) {
     return conversation;
   };
   writeTranscript([reply], replyTime);
-  return { appData, convId, metaStore, scanner, replyTime, reply, writeTranscript, findConversation };
+  return { appData, convDir, convId, metaStore, scanner, replyTime, reply, writeTranscript, findConversation };
 }
 
 test('WebSocket presence advances the iOS viewed step and reply signature', { timeout: 5000 }, async (t) => {
@@ -831,6 +834,100 @@ test('BrainScanner extracts assistant inline artifact images and serves them via
   }
 });
 
+test('BrainScanner keeps verified inline images in prose, comparison tables, and carousel fences', async (t) => {
+  const { convDir, writeTranscript, findConversation, scanner, convId, reply } = createReadCursorFixture(t);
+  const bytes = Buffer.from('test image');
+  for (const name of ['a.png', 'b preview.png', 'extra.png', 'figure (1).png']) {
+    writeFileSync(join(convDir, name), bytes);
+  }
+  const a = `![desc1](${join(convDir, 'a.png')})`;
+  const b = `![desc2](${join(convDir, 'b%20preview.png')})`;
+  const c = `![](file://${join(convDir, 'figure%20(1).png')})`;
+  writeTranscript([{
+    ...reply,
+    content: `Prose A\n${a}\nProse B\n${b}\n\n| Title 1 | Title 2 |\n| --- | --- |\n| ${a} | ${b} |\n\n\`\`\`\`carousel\n${c}\n<!-- slide -->\n${a}\n\`\`\`\``,
+    media: [{ uri: join(convDir, 'extra.png') }],
+  }], new Date(reply.created_at));
+
+  const aToken = '![desc1](levity-attachment://a.png)';
+  const bToken = '![desc2](levity-attachment://b%20preview.png)';
+  const cToken = '![](levity-attachment://figure%20%281%29.png)';
+  const detail = await scanner.getConversationDetail(convId);
+  const assistant = detail.items.find((item) => item.role === 'assistant');
+  assert.equal(assistant.content, [
+    'Prose A', aToken, 'Prose B', bToken, '',
+    '| Title 1 | Title 2 |', '| --- | --- |', `| ${aToken} | ${bToken} |`, '',
+    '````carousel', cToken, '<!-- slide -->', aToken, '````',
+  ].join('\n'));
+  assert.ok(!assistant.content.includes(convDir));
+  assert.ok(!assistant.content.includes('/Users/'));
+  assert.ok(!assistant.content.includes('extra.png'));
+  assert.deepEqual(assistant.attachments, [
+    ['extra.png', 'extra.png'], ['a.png', 'desc1'], ['b preview.png', 'desc2'], ['figure (1).png', 'figure (1).png'],
+  ].map(([fileName, name]) => ({
+    id: `img-${fileName}`, name, fileName, kind: 'image', mimeType: 'image/png', sizeBytes: bytes.length,
+  })));
+  assert.equal(scanner.resolveUploadedFilePath(convId, 'b preview.png'), join(convDir, 'b preview.png'));
+
+  const { lastPreview } = await findConversation();
+  assert.ok(lastPreview.startsWith('Prose A [图片: desc1] Prose B [图片: desc2]'));
+  assert.ok(!lastPreview.includes('levity-attachment://'));
+});
+
+test('BrainScanner leaves absolute, encoded traversal, and symlink image escapes unregistered', async (t) => {
+  const { convDir, writeTranscript, scanner, convId, reply } = createReadCursorFixture(t);
+  const outside = `${convDir}-sibling`;
+  mkdirSync(outside);
+  writeFileSync(join(outside, 'escape.png'), 'test image');
+  const symlink = join(convDir, 'escape-link.png');
+  symlinkSync(join(outside, 'escape.png'), symlink);
+  const escapedTarget = `${convDir}/%2e%2e/${convId}-sibling/escape.png`;
+  const content = [
+    `![absolute](${join(outside, 'escape.png')})`,
+    `![encoded](${escapedTarget})`,
+    `![linked](${symlink})`,
+  ].join('\n');
+  writeTranscript([{ ...reply, content, media: [{ uri: symlink }] }], new Date(reply.created_at));
+  const detail = await scanner.getConversationDetail(convId);
+  const assistant = detail.items.find((item) => item.role === 'assistant');
+  assert.equal(assistant.content, content);
+  assert.equal(assistant.attachments?.length ?? 0, 0);
+});
+
+test('BrainScanner preserves old read receipts for replies whose images were previously stripped', async (t) => {
+  const { convDir, writeTranscript, findConversation, scanner, convId, metaStore, reply } = createReadCursorFixture(t);
+  const image = join(convDir, 'preview.png');
+  writeFileSync(image, 'test image');
+  const oldContent = 'Before\n\nAfter';
+  const oldDigest = createHash('sha256').update(oldContent).digest('hex').slice(0, 16);
+  writeTranscript([{ ...reply, content: `Before\n![Original](${image})\nAfter` }], new Date(reply.created_at));
+  metaStore.markConversationViewed(convId, Date.now(), { stepIndex: 17, replySig: `17:${oldContent.length}:1:${oldDigest}` });
+  assert.equal((await findConversation()).hasUnread, false);
+
+  metaStore.markConversationViewed(convId, Date.now(), scanner.getConversationReadCursor(convId));
+  writeTranscript([{ ...reply, content: `Before\n![New crop](${image})\nAfter` }], new Date(Date.now() + 1_000));
+  assert.equal((await findConversation()).hasUnread, true);
+});
+
+test('APNs previews include inline image captions without any attachment URI', async () => {
+  const alerts = [];
+  const pusher = new ApnsPusher({
+    keyPath: '',
+    metaStore: { listPushDevices: () => [{ token: 'a'.repeat(64), environment: 'sandbox' }] },
+    sendFn: async ({ payload }) => {
+      alerts.push(payload.aps.alert);
+      return { sent: true };
+    },
+  });
+  const result = await pusher.notifyConversation({
+    conversationId: 'test-inline-images',
+    title: 'Levity',
+    body: 'Before\n![Dark mode](levity-attachment://dark%20mode.png)\n![](levity-attachment://light.png)\nAfter',
+  });
+  assert.equal(result.sent, 1);
+  assert.deepEqual(alerts, [{ title: 'Levity', body: 'Before [图片: Dark mode] [图片] After' }]);
+});
+
 test('BridgeServer emits workspaces_updated on preview change and resync_required when since_seq exceeds server epoch', async () => {
   const sandbox = mkdtempSync(join(tmpdir(), 'agz-resync-test-'));
   try {
@@ -1477,19 +1574,19 @@ test('BridgeServer persists conversation to-do flag and broadcasts workspaces_up
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ flagged: true, flagNote: '  Ship v1.0.7 next  ' }),
+        body: JSON.stringify({ flagged: true, flagNote: '  明天推 v0.7.3  ' }),
       });
       assert.equal(flagRes.status, 200);
       const flagJson = await flagRes.json();
       assert.equal(flagJson.ok, true);
       assert.equal(flagJson.flagged, true);
-      assert.equal(flagJson.flagNote, 'Ship v1.0.7 next');
+      assert.equal(flagJson.flagNote, '明天推 v0.7.3');
 
       const wsFlagEv = bridge.ringBuffer.find((e) => e.type === 'workspaces_updated');
       assert.ok(wsFlagEv, 'Flagging must broadcast workspaces_updated to other paired devices');
       const flaggedConv = wsFlagEv.workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
       assert.equal(flaggedConv?.flagged, true);
-      assert.equal(flaggedConv?.flagNote, 'Ship v1.0.7 next');
+      assert.equal(flaggedConv?.flagNote, '明天推 v0.7.3');
 
       // Updating flagNote while flagged must also broadcast workspaces_updated
       bridge.ringBuffer.length = 0;
@@ -1499,15 +1596,15 @@ test('BridgeServer persists conversation to-do flag and broadcasts workspaces_up
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ flagged: true, flagNote: 'Verify on device first' }),
+        body: JSON.stringify({ flagged: true, flagNote: '顺手测完真机再发' }),
       });
       assert.equal(editNoteRes.status, 200);
       const editNoteJson = await editNoteRes.json();
-      assert.equal(editNoteJson.flagNote, 'Verify on device first');
+      assert.equal(editNoteJson.flagNote, '顺手测完真机再发');
       const wsEditEv = bridge.ringBuffer.find((e) => e.type === 'workspaces_updated');
       assert.ok(wsEditEv, 'Editing flagNote must broadcast workspaces_updated');
       const editedConv = wsEditEv.workspaces.flatMap((w) => w.conversations).find((c) => c.id === convId);
-      assert.equal(editedConv?.flagNote, 'Verify on device first');
+      assert.equal(editedConv?.flagNote, '顺手测完真机再发');
 
       // Unflagging clears flagNote cleanly
       bridge.ringBuffer.length = 0;
@@ -2027,7 +2124,7 @@ test('Step-index read cursor and completion mtime guarantee hasUnread=true on fl
     const annDir = join(appData, 'annotations');
     mkdirSync(annDir, { recursive: true });
 
-    const convId = 'f1f1f1f1-1111-4222-8333-444444444444';
+    const convId = '58dd75c3-1111-4222-8333-444444444444';
     const logDir = join(appData, 'brain', convId, '.system_generated', 'logs');
     mkdirSync(logDir, { recursive: true });
     const tPath = join(logDir, 'transcript.jsonl');
@@ -2036,7 +2133,7 @@ test('Step-index read cursor and completion mtime guarantee hasUnread=true on fl
     const turn1Sec = Math.floor((nowMs - 60_000) / 1000);
     writeFileSync(
       join(annDir, `${convId}.pbtxt`),
-      `title:"Flagged Task Session" last_user_view_time:{seconds:${turn1Sec + 5} nanos:0}\n`,
+      `title:"Lose it MCP" last_user_view_time:{seconds:${turn1Sec + 5} nanos:0}\n`,
       'utf-8'
     );
     const turn1Lines = [
@@ -2105,7 +2202,7 @@ test('Step-index read cursor and completion mtime guarantee hasUnread=true on fl
       );
       writeFileSync(
         join(annDir, `${convId}.pbtxt`),
-        `title:"Flagged Task Session" last_user_view_time:{seconds:${turn2StartSec + 1} nanos:0}\n`,
+        `title:"Lose it MCP" last_user_view_time:{seconds:${turn2StartSec + 1} nanos:0}\n`,
         'utf-8'
       );
 
@@ -2200,7 +2297,7 @@ test('Step-index read cursor and completion mtime guarantee hasUnread=true on fl
       const afterCompleteSec = Math.ceil(Date.now() / 1000) + 5;
       writeFileSync(
         join(annDir, `${convId}.pbtxt`),
-        `title:"Flagged Task Session" last_user_view_time:{seconds:${afterCompleteSec} nanos:0}\n`,
+        `title:"Lose it MCP" last_user_view_time:{seconds:${afterCompleteSec} nanos:0}\n`,
         'utf-8'
       );
       await bridge.pollChanges();
@@ -2217,4 +2314,367 @@ test('Step-index read cursor and completion mtime guarantee hasUnread=true on fl
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
   }
+});
+
+function createBridgeUpdateFixture(t, options = {}) {
+  const sandbox = mkdtempSync(join(tmpdir(), 'levity-update-'));
+  t.after(() => rmSync(sandbox, { recursive: true, force: true }));
+  const remote = join(sandbox, 'origin.git');
+  const publisher = join(sandbox, 'publisher');
+  const repoRoot = join(sandbox, 'bridge');
+  const git = (cwd, ...args) => execFileSync('git', args, {
+    cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+  const configure = cwd => {
+    git(cwd, 'config', 'user.name', 'Bridge Test');
+    git(cwd, 'config', 'user.email', 'bridge@example.invalid');
+    git(cwd, 'config', 'commit.gpgsign', 'false');
+    git(cwd, 'config', 'core.hooksPath', join(sandbox, 'no-hooks'));
+  };
+  git(sandbox, 'init', '--bare', '--initial-branch=main', remote);
+  git(sandbox, 'clone', remote, publisher);
+  configure(publisher);
+  mkdirSync(join(publisher, 'BridgeServer', 'src'), { recursive: true });
+  const writeVersion = (cwd, version) => writeFileSync(join(cwd, 'BridgeServer', 'package.json'), JSON.stringify({ version }));
+  const writeCore = (cwd, content) => writeFileSync(join(cwd, 'BridgeServer', 'src', 'sidecar-entry.mjs'), content);
+  const original = 'export const original = true;\n';
+  writeVersion(publisher, '1.1.0');
+  writeCore(publisher, original);
+  git(publisher, 'add', '.');
+  git(publisher, 'commit', '-m', 'Initial bridge');
+  git(remote, 'fetch', publisher, 'refs/heads/main:refs/heads/main');
+  git(sandbox, 'clone', remote, repoRoot);
+  configure(repoRoot);
+  const publish = (version = '1.2.0', content = 'export const updated = true;\n') => {
+    writeVersion(publisher, version);
+    writeCore(publisher, content);
+    git(publisher, 'commit', '-am', 'Publish update');
+    git(remote, 'fetch', publisher, 'refs/heads/main:refs/heads/main');
+  };
+  const updater = new BridgeUpdater({
+    repoRoot,
+    fetchFn: async () => ({ ok: false, status: 404 }),
+    ...options,
+  });
+  const localGit = (...args) => git(repoRoot, ...args);
+  const readCore = () => readFileSync(join(repoRoot, 'BridgeServer', 'src', 'sidecar-entry.mjs'), 'utf8');
+  return {
+    sandbox, repoRoot, publisher, updater, publish, localGit, readCore, original, writeCore,
+    stageUpstream: path => git(publisher, 'add', path),
+  };
+}
+
+test('Bridge updater compares supported SemVer versions and prereleases', () => {
+  const versions = ['0.1.0', '1.0.7', '1.1.0', '1.1.10', '2.0.0'];
+  for (let index = 1; index < versions.length; index++) {
+    assert.equal(compareSemver(versions[index - 1], versions[index]), -1);
+    assert.equal(compareSemver(versions[index], versions[index - 1]), 1);
+  }
+  assert.equal(compareSemver('v1.1.0', '1.1'), 0);
+  assert.equal(compareSemver('1.1.0+build.1', '1.1.0'), 0);
+  assert.equal(compareSemver('1.1.0-rc.2', '1.1.0-rc.10'), -1);
+  assert.equal(compareSemver('1.1.0-rc.10', '1.1.0'), -1);
+  assert.equal(compareSemver('1.1.0-01', '1.1.0'), -1);
+});
+
+test('Bridge updater uses the release cache and detects same-version upstream commits on forced checks', async t => {
+  let now = 0;
+  let requests = 0;
+  const fixture = createBridgeUpdateFixture(t, {
+    nowFn: () => now,
+    fetchFn: async (url, request) => {
+      assert.match(url, /\/releases\/latest$/);
+      assert.equal(request.headers['User-Agent'], 'LevityBridge/1.1.0');
+      assert.ok(request.signal instanceof AbortSignal);
+      requests++;
+      return { ok: true, json: async () => ({ tag_name: 'v1.1.0', body: 'Notes', html_url: 'https://example.invalid/release' }) };
+    },
+  });
+  fixture.publish('1.1.0');
+  const first = await fixture.updater.checkForUpdates();
+  assert.equal(first.updateAvailable, false);
+  assert.equal(first.releaseNotes, 'Notes');
+  now = 1000;
+  assert.equal((await fixture.updater.checkForUpdates()).checkedAt, first.checkedAt);
+  assert.equal(requests, 1);
+  now += 6 * 60 * 60 * 1000;
+  assert.notEqual((await fixture.updater.checkForUpdates()).checkedAt, first.checkedAt);
+  assert.equal(requests, 2);
+  const forced = await fixture.updater.checkForUpdates({ force: true });
+  assert.equal(requests, 3);
+  assert.equal(forced.commitsBehind, 1);
+  assert.equal(forced.latestVersion, '1.1.0');
+  assert.equal(forced.updateAvailable, true);
+  assert.equal(fixture.updater.getCachedSummary().releaseNotes, undefined);
+});
+
+test('Bridge updater honors the network opt-out for forced checks', async t => {
+  let requests = 0;
+  const fixture = createBridgeUpdateFixture(t, {
+    fetchFn: async () => {
+      requests++;
+      return { ok: false };
+    },
+  });
+  const envValue = process.env.LEVITY_UPDATE_CHECK;
+  process.env.LEVITY_UPDATE_CHECK = 'off';
+  t.after(() => {
+    if (envValue === undefined) delete process.env.LEVITY_UPDATE_CHECK;
+    else process.env.LEVITY_UPDATE_CHECK = envValue;
+  });
+  fixture.publish();
+  const before = fixture.localGit('rev-parse', 'origin/main');
+  const status = await fixture.updater.checkForUpdates({ force: true });
+  assert.equal(status.currentVersion, '1.1.0');
+  assert.equal(status.canSelfUpdate, true);
+  assert.equal(status.checkedAt, null);
+  assert.equal(requests, 0);
+  assert.equal(fixture.localGit('rev-parse', 'origin/main'), before);
+});
+
+test('Bridge updater fast-forwards a clean checkout and reports a second update as unnecessary', async t => {
+  const { updater, publish, localGit } = createBridgeUpdateFixture(t);
+  const previousCommit = localGit('rev-parse', '--short', 'HEAD');
+  localGit('branch', '--unset-upstream');
+  publish();
+  const result = await updater.performUpdate();
+  assert.deepEqual(result, {
+    ok: true, httpStatus: 200, status: 'updated_restarting', previousVersion: '1.1.0',
+    newVersion: '1.2.0', previousCommit, newCommit: localGit('rev-parse', '--short', 'HEAD'), restarting: true,
+  });
+  assert.notEqual(result.previousCommit, result.newCommit);
+  assert.equal(localGit('status', '--porcelain'), '');
+  assert.equal(updater.getCachedSummary().currentVersion, '1.2.0');
+  assert.deepEqual(await updater.performUpdate(), {
+    ok: true, httpStatus: 200, status: 'already_up_to_date', currentVersion: '1.2.0',
+    previousVersion: '1.2.0', newVersion: '1.2.0', restarting: false,
+  });
+});
+
+test('Bridge updater preserves unstaged and staged tracked edits byte for byte', async t => {
+  let restarts = 0;
+  const fixture = createBridgeUpdateFixture(t, { onRequestRestart: () => restarts++ });
+  const { updater, publish, readCore, writeCore, localGit, repoRoot } = fixture;
+  publish();
+  const changed = 'export const local = "未提交";\r\n';
+  const previousHead = localGit('rev-parse', 'HEAD');
+  writeCore(repoRoot, changed);
+  for (const staged of [false, true]) {
+    if (staged) localGit('add', 'BridgeServer/src/sidecar-entry.mjs');
+    const result = await updater.performUpdate();
+    assert.equal(result.httpStatus, 409);
+    assert.equal(result.status, 'dirty_worktree');
+    assert.equal(readCore(), changed);
+    assert.equal(localGit('rev-parse', 'HEAD'), previousHead);
+    assert.equal(restarts, 0);
+  }
+});
+
+test('Bridge updater rejects diverged branches and preserves the local commit', async t => {
+  const { updater, publish, localGit, readCore, writeCore, repoRoot } = createBridgeUpdateFixture(t);
+  publish();
+  const local = 'export const local = true;\n';
+  writeCore(repoRoot, local);
+  localGit('commit', '-am', 'Local change');
+  const previousHead = localGit('rev-parse', 'HEAD');
+  const result = await updater.performUpdate();
+  assert.equal(result.httpStatus, 409);
+  assert.equal(result.status, 'diverged');
+  assert.equal(localGit('rev-parse', 'HEAD'), previousHead);
+  assert.equal(readCore(), local);
+});
+
+test('Bridge updater rolls invalid syntax back to the original clean commit without restart', async t => {
+  let restarts = 0;
+  const { updater, publish, localGit, readCore, original } = createBridgeUpdateFixture(t, {
+    onRequestRestart: () => restarts++,
+  });
+  const previousHead = localGit('rev-parse', 'HEAD');
+  publish('1.2.0', 'export const = ;\n');
+  const result = await updater.performUpdate();
+  assert.equal(result.httpStatus, 500);
+  assert.equal(result.status, 'rolled_back');
+  assert.equal(result.newVersion, '1.1.0');
+  assert.equal(result.restarting, false);
+  assert.equal(localGit('rev-parse', 'HEAD'), previousHead);
+  assert.equal(localGit('status', '--porcelain'), '');
+  assert.equal(readCore(), original);
+  assert.equal(restarts, 0);
+  assert.deepEqual((await updater.checkForUpdates()).lastResult, result);
+});
+
+test('Bridge updater reports standalone, detached HEAD, and missing origin accurately', async t => {
+  const { sandbox, updater, localGit, repoRoot } = createBridgeUpdateFixture(t);
+  const standalone = new BridgeUpdater({
+    repoRoot: join(repoRoot, 'BridgeServer'),
+    packageJsonPath: join(sandbox, 'missing.json'),
+    fetchFn: async () => ({ ok: false }),
+  });
+  const status = await standalone.checkForUpdates();
+  assert.equal(status.currentVersion, '1.1.0');
+  assert.equal(status.installKind, 'standalone');
+  assert.equal(status.canSelfUpdate, false);
+  assert.equal(status.blockReason, 'not_git_repo');
+  assert.equal((await standalone.performUpdate()).status, 'not_git_repo');
+  localGit('switch', '--detach');
+  assert.equal((await updater.performUpdate()).status, 'detached_head');
+  localGit('switch', 'main');
+  localGit('remote', 'remove', 'origin');
+  assert.equal((await updater.performUpdate()).status, 'no_remote');
+});
+
+test('Bridge updater keeps an ignored file that the upstream update would overwrite', async t => {
+  const { updater, publish, localGit, readCore, repoRoot, original, publisher, stageUpstream } = createBridgeUpdateFixture(t);
+  const notes = join(repoRoot, 'notes.txt');
+  writeFileSync(join(repoRoot, '.git', 'info', 'exclude'), 'notes.txt\n');
+  writeFileSync(notes, 'private notes');
+  writeFileSync(join(publisher, 'notes.txt'), 'upstream notes');
+  stageUpstream('notes.txt');
+  publish();
+  assert.equal((await updater.performUpdate()).status, 'merge_failed');
+  assert.equal(readFileSync(notes, 'utf8'), 'private notes');
+  assert.equal(readCore(), original);
+  assert.equal(localGit('status', '--porcelain'), '');
+});
+
+test('Bridge updater protects local edits made during failed post-merge verification', async t => {
+  const localEdit = 'export const editedDuringUpdate = true;\n';
+  const fixture = createBridgeUpdateFixture(t, {
+    execFileFn: (file, args, options) => {
+      if (file === process.execPath && args[0] === '--check') {
+        writeFileSync(args[1], localEdit);
+        throw new Error('Syntax verification failed');
+      }
+      return execFileSync(file, args, options);
+    },
+  });
+  fixture.publish('1.2.0', 'export const = ;\n');
+  const result = await fixture.updater.performUpdate();
+  assert.equal(result.status, 'rollback_failed');
+  assert.equal(result.restarting, false);
+  assert.equal(fixture.readCore(), localEdit);
+});
+
+test('Bridge updater runs the installer only when a plugin manifest or installer changes', async t => {
+  const { updater, publisher, publish, repoRoot, stageUpstream } = createBridgeUpdateFixture(t);
+  const installer = 'scripts/install-plugin.mjs';
+  mkdirSync(join(publisher, 'scripts'));
+  writeFileSync(join(publisher, installer), "import { appendFileSync } from 'node:fs';\nappendFileSync('installer-runs', '1');\n");
+  stageUpstream(installer);
+  publish();
+  assert.equal((await updater.performUpdate()).status, 'updated_restarting');
+  const marker = join(repoRoot, 'installer-runs');
+  assert.equal(readFileSync(marker, 'utf8'), '1');
+  publish('1.2.1', 'export const updatedAgain = true;\n');
+  assert.equal((await updater.performUpdate()).status, 'updated_restarting');
+  assert.equal(readFileSync(marker, 'utf8'), '1');
+  writeFileSync(join(publisher, 'plugin.json'), '{}');
+  stageUpstream('plugin.json');
+  publish('1.2.2');
+  assert.equal((await updater.performUpdate()).status, 'updated_restarting');
+  assert.equal(readFileSync(marker, 'utf8'), '11');
+});
+
+test('Bridge updater rejects concurrent update calls while Git fetch is in flight', async t => {
+  let enteredFetch;
+  const fetching = new Promise(resolve => { enteredFetch = resolve; });
+  let releaseFetch;
+  const pendingFetch = new Promise(resolve => { releaseFetch = resolve; });
+  const fixture = createBridgeUpdateFixture(t, {
+    execFileFn: async (file, args, options) => {
+      if (file === 'git' && args[0] === 'fetch') {
+        enteredFetch();
+        await pendingFetch;
+      }
+      return new Promise((resolve, reject) => {
+        execFile(file, args, options, (error, stdout) => error ? reject(error) : resolve(stdout));
+      });
+    },
+  });
+  fixture.publish();
+  const first = fixture.updater.performUpdate();
+  try {
+    await Promise.race([fetching, first]);
+    const second = await fixture.updater.performUpdate();
+    assert.equal(second.httpStatus, 409);
+    assert.equal(second.status, 'already_updating');
+  } finally {
+    releaseFetch();
+  }
+  assert.equal((await first).status, 'updated_restarting');
+});
+
+test('Bridge updater advertises the endpoint and blocks one-tap when no supervisor can restart the host', async t => {
+  const { updater, publish, localGit } = createBridgeUpdateFixture(t);
+  const { metaStore, scanner } = createReadCursorFixture(t);
+  const bridge = new BridgeServer({
+    metaStore, brainScanner: scanner, agentController: { isAvailable: () => false }, bridgeUpdater: updater,
+  });
+  publish();
+  const previousHead = localGit('rev-parse', 'HEAD');
+  const status = await bridge.checkBridgeUpdate(true);
+  assert.equal(status.updateAvailable, true);
+  assert.equal(status.canSelfUpdate, false);
+  assert.equal(status.blockReason, 'manual_restart_required');
+  assert.ok(bridge.getPublicStatus().capabilities.includes('self_update'));
+  assert.equal((await bridge.performBridgeUpdate()).status, 'manual_restart_required');
+  assert.equal(localGit('rev-parse', 'HEAD'), previousHead);
+});
+
+test('Bridge update HTTP routes authenticate, advertise the handshake, and schedule one restart after success', async t => {
+  let restarts = 0;
+  let restarted;
+  const restartSignal = new Promise(resolve => { restarted = resolve; });
+  const { updater, publish } = createBridgeUpdateFixture(t, {
+    onRequestRestart: () => {
+      restarts++;
+      restarted();
+    },
+  });
+  const { metaStore, scanner } = createReadCursorFixture(t);
+  const bridge = new BridgeServer({
+    port: 0,
+    host: '127.0.0.1',
+    metaStore,
+    brainScanner: scanner,
+    agentController: { isAvailable: () => false },
+    bridgeUpdater: updater,
+  });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  const base = `http://127.0.0.1:${bridge.getBoundPort()}`;
+  const headers = { Authorization: `Bearer ${metaStore.getToken()}` };
+  for (const [path, method] of [['update-status', 'GET'], ['update', 'POST']]) {
+    assert.equal((await fetch(`${base}/api/v1/bridge/${path}`, { method })).status, 401);
+  }
+  const boot = await fetch(`${base}/api/v1/bootstrap`, { headers }).then(res => res.json());
+  assert.equal(boot.server.version, '1.1.0');
+  assert.equal(boot.server.protocolVersion, 2);
+  assert.deepEqual(boot.server.capabilities, ['inline_images', 'bridge_update_check', 'self_update']);
+  assert.equal(boot.server.updateInfo.canSelfUpdate, true);
+  assert.equal(bridge.getPairingInfo().version, '1.1.0');
+  const postUpdate = () => fetch(`${base}/api/v1/bridge/update`, { method: 'POST', headers });
+  const noUpdate = await postUpdate().then(res => res.json());
+  assert.equal(noUpdate.status, 'already_up_to_date');
+  assert.equal(noUpdate.restarting, false);
+  assert.equal(bridge.restartScheduled, false);
+  publish();
+  const status = await fetch(`${base}/api/v1/bridge/update-status?force=1`, { headers }).then(res => res.json());
+  assert.equal(status.updateAvailable, true);
+  assert.equal(status.commitsBehind, 1);
+  assert.equal(status.canSelfUpdate, true);
+  const response = await postUpdate();
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.status, 'updated_restarting');
+  assert.equal(result.newVersion, '1.2.0');
+  assert.equal(result.restarting, true);
+  assert.equal(restarts, 0);
+  const timeout = AbortSignal.timeout(3000);
+  await Promise.race([
+    restartSignal,
+    new Promise((_, reject) => timeout.addEventListener('abort', () => reject(timeout.reason), { once: true })),
+  ]);
+  bridge.scheduleRestart();
+  assert.equal(restarts, 1);
 });

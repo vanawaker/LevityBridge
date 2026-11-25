@@ -5,11 +5,12 @@
  * questions/permission waits, resolves workspace grouping, and nests subagents.
  */
 import { createHash } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, extname, join, resolve as resolvePath, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
+import { stripInlineAttachmentMarkdown } from './inline-attachments.mjs';
 import { lookupModelInfo } from './model-catalog.mjs';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -18,6 +19,10 @@ const ARTIFACT_EXTS = new Set(['.md', '.png', '.jpg', '.jpeg', '.webp', '.svg', 
 
 function replyDigest(text) {
   return createHash('sha256').update(text).digest('hex').slice(0, 16);
+}
+
+function assistantReplySignature(stepIdx, content, attachmentCount) {
+  return `${stepIdx}:${content.length}:${attachmentCount}:${replyDigest(content)}`;
 }
 
 function extractSettingsChanges(raw) {
@@ -73,22 +78,24 @@ function extractAssistantInlineImages(rawContent, convDir, stepMedia = null) {
   const found = new Map();
   const resolvedConvDir = resolvePath(convDir);
   const allowedPrefix = resolvedConvDir + sep;
+  let realConvPrefix;
 
-  const tryRegisterLocalImage = (rawTarget, altText = '') => {
-    const cleanTarget = uriToPath(String(rawTarget || '').trim());
-    if (!cleanTarget || !cleanTarget.startsWith('/')) return false;
+  const registerPath = (cleanTarget, altText) => {
+    if (!cleanTarget.startsWith('/')) return null;
     const resolved = resolvePath(cleanTarget);
-    if (!resolved.startsWith(allowedPrefix)) return false;
+    if (!resolved.startsWith(allowedPrefix)) return null;
     const fName = basename(resolved);
-    if (!fName || fName.startsWith('.') || inferAttachmentKind(fName) !== 'image') return false;
+    if (!fName || fName.startsWith('.') || inferAttachmentKind(fName) !== 'image') return null;
     let sizeBytes = 0;
     try {
-      if (!existsSync(resolved)) return false;
-      const st = statSync(resolved);
-      if (!st.isFile()) return false;
+      realConvPrefix ??= realpathSync(resolvedConvDir) + sep;
+      const realFile = realpathSync(resolved);
+      if (!realFile.startsWith(realConvPrefix)) return null;
+      const st = statSync(realFile);
+      if (!st.isFile()) return null;
       sizeBytes = st.size;
     } catch {
-      return false;
+      return null;
     }
     if (!found.has(fName)) {
       found.set(fName, {
@@ -100,29 +107,48 @@ function extractAssistantInlineImages(rawContent, convDir, stepMedia = null) {
         sizeBytes,
       });
     }
-    return true;
+    return fName;
+  };
+
+  const tryRegisterLocalImage = (rawTarget, altText = '') => {
+    const target = rawTarget.trim().replace(/^<([^>]+)>$/, '$1');
+    try {
+      if (target.startsWith('file://')) return registerPath(fileURLToPath(target), altText);
+      if (!target.startsWith('/')) return null;
+      return registerPath(target, altText)
+        ?? (target.includes('%') ? registerPath(decodeURIComponent(target), altText) : null);
+    } catch {
+      return null;
+    }
   };
 
   if (Array.isArray(stepMedia)) {
     for (const m of stepMedia) {
       const uri = String(m?.uri || '').trim();
-      if (uri) tryRegisterLocalImage(uri, '');
+      if (uri && !tryRegisterLocalImage(uri) && uri.includes(',')) {
+        tryRegisterLocalImage(uri.split(',')[0]);
+      }
     }
   }
 
-  let cleaned = String(rawContent || '');
-  if (cleaned) {
-    cleaned = cleaned.replace(/!\[([^\]]*)\]\(([^)\n]+)\)/g, (full, alt, target) => {
-      if (tryRegisterLocalImage(target, alt)) {
-        return '';
-      }
-      return full;
-    });
-    cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
-  }
+  const source = String(rawContent || '');
+  const legacyParts = [];
+  let legacyStart = 0;
+  const content = source.replace(/!\[((?:\\.|[^\]\\])*)\]\((<[^>\n]+>|(?:[^()\n]|\([^()\n]*\))+)\)/g, (full, alt, target, offset) => {
+    const cleanAlt = String(alt || '').replace(/\\\]/g, ']').replace(/[\r\n]+/g, ' ').replace(/\]/g, ')').trim();
+    const fileName = tryRegisterLocalImage(target, cleanAlt);
+    if (!fileName) return full;
+    legacyParts.push(source.slice(legacyStart, offset));
+    legacyStart = offset + full.length;
+    // encodeURIComponent leaves parentheses unescaped, where they would delimit Markdown.
+    const encoded = encodeURIComponent(fileName).replace(/\(/g, '%28').replace(/\)/g, '%29');
+    return `![${cleanAlt}](levity-attachment://${encoded})`;
+  });
+  const legacyContent = (legacyParts.join('') + source.slice(legacyStart)).replace(/\n{3,}/g, '\n\n').trim();
 
   return {
-    cleanedContent: cleaned,
+    cleanedContent: legacyParts.length ? content : legacyContent,
+    legacyContent: legacyParts.length ? legacyContent : null,
     attachments: [...found.values()],
   };
 }
@@ -761,6 +787,7 @@ export class BrainScanner {
       lastAssistantReplyMs: 0,
       lastAssistantStepIndex: -1,
       lastAssistantReplySig: '',
+      lastAssistantLegacyImageReplySig: '',
       stepCount: 0,
       lastStepIndex: null,
       lastStepType: null,
@@ -799,6 +826,7 @@ export class BrainScanner {
     let lastAssistantReplyMs = 0;
     let lastAssistantStepIndex = -1;
     let lastAssistantReplySig = '';
+    let lastAssistantLegacyImageReplySig = '';
     let hasNonBookkeepingStepAfterLastAssistant = false;
     let stepCount = 0;
     let lastStepIndex = null;
@@ -863,7 +891,7 @@ export class BrainScanner {
         if (!text && desktopAtts.length === 0) continue;
         if (text) scoreTextForProjects(text, 2);
         if (!firstUserText && text) firstUserText = text;
-        lastPreview = (text || `[附件] ${desktopAtts.map((a) => a.name).join('、')}`).slice(0, 140);
+        lastPreview = stripInlineAttachmentMarkdown(text || `[附件] ${desktopAtts.map((a) => a.name).join('、')}`).slice(0, 140);
 
         // Deduplicate if `[AntigravityZ_USER_PROMPT]` SYSTEM_MESSAGE arrived right before USER_INPUT
         const prevItem = items[items.length - 1];
@@ -905,7 +933,7 @@ export class BrainScanner {
           turnPendingSubagents.clear();
           if (mobile.mode) detectedMode = mobile.mode;
           if (!firstUserText && !mobile.isControlOnly) firstUserText = mobile.text;
-          lastPreview = mobile.text.slice(0, 140);
+          lastPreview = stripInlineAttachmentMarkdown(mobile.text).slice(0, 140);
 
           // Deduplicate when PreInvocation hook injected `USER_INPUT` right BEFORE `[AntigravityZ_USER_PROMPT]` SYSTEM_MESSAGE!
           const prevItem = items[items.length - 1];
@@ -1014,7 +1042,7 @@ export class BrainScanner {
         });
 
         const rawAssistantContent = typeof step.content === 'string' ? step.content.trim() : '';
-        const { cleanedContent: content, attachments: assistantAtts } = extractAssistantInlineImages(
+        const { cleanedContent: content, legacyContent, attachments: assistantAtts } = extractAssistantInlineImages(
           rawAssistantContent,
           convDir,
           step.media
@@ -1028,16 +1056,17 @@ export class BrainScanner {
           }
           if (stepIdx >= lastAssistantStepIndex) {
             lastAssistantStepIndex = stepIdx;
-            lastAssistantReplySig = `${stepIdx}:${content.length}:${assistantAtts.length}:${replyDigest(content)}`;
+            lastAssistantReplySig = assistantReplySignature(stepIdx, content, assistantAtts.length);
+            lastAssistantLegacyImageReplySig = legacyContent === null ? '' : assistantReplySignature(stepIdx, legacyContent, assistantAtts.length);
             hasNonBookkeepingStepAfterLastAssistant = false;
           }
         } else if (mappedTools.length > 0 && lastAssistantStepIndex >= 0) {
           hasNonBookkeepingStepAfterLastAssistant = true;
         }
         if (content) {
-          lastPreview = content.replace(/\s+/g, ' ').slice(0, 140);
+          lastPreview = stripInlineAttachmentMarkdown(content).replace(/\s+/g, ' ').slice(0, 140);
         } else if (assistantAtts.length > 0) {
-          lastPreview = `[图片] ${assistantAtts.map((a) => a.name).join('、')}`.slice(0, 140);
+          lastPreview = stripInlineAttachmentMarkdown(`[图片] ${assistantAtts.map((a) => a.name).join('、')}`).slice(0, 140);
         }
 
         const isTurnFinal = mappedTools.length === 0 && (Boolean(content) || assistantAtts.length > 0);
@@ -1095,7 +1124,7 @@ export class BrainScanner {
         }
       } else if (step.type === 'ERROR_MESSAGE' || step.status === 'ERROR') {
         const errText = String(step.content || '执行过程中出现错误').trim();
-        lastPreview = errText.slice(0, 140);
+        lastPreview = stripInlineAttachmentMarkdown(errText).slice(0, 140);
         const errMs = createdAt ? Date.parse(createdAt) : 0;
         const effectiveErrMs = Number.isFinite(errMs) && errMs > 0 ? errMs : st.mtimeMs;
         if (effectiveErrMs > lastAssistantReplyMs) {
@@ -1104,6 +1133,7 @@ export class BrainScanner {
         if (stepIdx >= lastAssistantStepIndex) {
           lastAssistantStepIndex = stepIdx;
           lastAssistantReplySig = `${stepIdx}:err:${errText.length}:${replyDigest(errText)}`;
+          lastAssistantLegacyImageReplySig = '';
           hasNonBookkeepingStepAfterLastAssistant = false;
         }
         items.push({
@@ -1193,6 +1223,7 @@ export class BrainScanner {
       lastAssistantReplyMs,
       lastAssistantStepIndex,
       lastAssistantReplySig,
+      lastAssistantLegacyImageReplySig,
       stepCount,
       lastStepIndex,
       lastStepType,
@@ -1780,7 +1811,7 @@ export class BrainScanner {
       if (latestPending && latestPending.sentAt > updatedMs) {
         updatedMs = latestPending.sentAt;
         if (latestPending.text) {
-          effectivePreview = String(latestPending.text).replace(/\s+/g, ' ').slice(0, 140);
+          effectivePreview = stripInlineAttachmentMarkdown(latestPending.text).replace(/\s+/g, ' ').slice(0, 140);
         }
       }
       if (runStatus.state === 'running' && hook && hook.activity !== 'idle' && nowScanMs - hook.updatedAt < 90_000) {
@@ -1808,8 +1839,10 @@ export class BrainScanner {
       const lastAssistantStepIndex =
         typeof c.parsed.lastAssistantStepIndex === 'number' ? c.parsed.lastAssistantStepIndex : -1;
       const lastAssistantReplySig = c.parsed.lastAssistantReplySig || '';
-      // Previously stored cursors used the same signature without the content digest.
+      // Older cursors can omit the digest or fingerprint the reply with image Markdown removed.
       const legacyReplySig = lastAssistantReplySig.slice(0, lastAssistantReplySig.lastIndexOf(':'));
+      const legacyImageReplySig = c.parsed.lastAssistantLegacyImageReplySig || '';
+      const legacyImageReplySigWithoutDigest = legacyImageReplySig.slice(0, legacyImageReplySig.lastIndexOf(':'));
       let hasUnread = false;
       if (!archived && runStatus.state !== 'running') {
         if (pendingInteraction) {
@@ -1821,7 +1854,8 @@ export class BrainScanner {
             readOnIos =
               lastAssistantStepIndex < iosViewedStepIndex ||
               (lastAssistantStepIndex === iosViewedStepIndex &&
-                (!iosViewedReplySig || iosViewedReplySig === lastAssistantReplySig || iosViewedReplySig === legacyReplySig));
+                (!iosViewedReplySig || iosViewedReplySig === lastAssistantReplySig || iosViewedReplySig === legacyReplySig ||
+                  iosViewedReplySig === legacyImageReplySig || iosViewedReplySig === legacyImageReplySigWithoutDigest));
           } else if (iosViewedMs > 0) {
             readOnIos = lastReplyMs <= iosViewedMs + 250;
           }

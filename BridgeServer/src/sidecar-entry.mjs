@@ -70,6 +70,8 @@ async function main() {
     brainScanner,
     agentController,
     apnsPusher,
+    managedSidecar: Boolean(process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR),
+    onRequestRestart: () => { bridge.stop().finally(() => process.exit(0)); },
   });
 
   await bridge.start();
@@ -99,6 +101,20 @@ async function main() {
         'GET'
       );
       app.api('/api/status', () => bridge.getPairingInfo(), 'GET');
+      app.api('/api/bridge-update-status', () => bridge.checkBridgeUpdate(true), 'GET');
+      app.api(
+        '/api/bridge-update',
+        async (data) => {
+          if (!bridge.matchesPairingToken(data?.token)) {
+            return { ok: false, httpStatus: 401, status: 'unauthorized', message: 'Refresh the pairing panel and try again.' };
+          }
+          const result = await bridge.performBridgeUpdate();
+          // The SDK serializes this return value. Give it time to deliver the response.
+          if (result.ok && result.restarting) bridge.scheduleRestart();
+          return result;
+        },
+        'POST'
+      );
       app.api(
         '/api/rotate-token',
         () => {

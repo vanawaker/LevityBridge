@@ -5,6 +5,7 @@
 import { createHash, sign as cryptoSign } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import http2 from 'node:http2';
+import { stripInlineAttachmentMarkdown } from './inline-attachments.mjs';
 
 const PRESENCE_LEASE_MS = 45_000;
 const JWT_TTL_SEC = 50 * 60;
@@ -280,11 +281,11 @@ export class ApnsPusher {
     }
 
     const alert = {
-      title: String(title || 'Levity').slice(0, 80),
-      body: String(body || 'Session updated').replace(/\s+/g, ' ').trim().slice(0, 180),
+      title: stripInlineAttachmentMarkdown(title || 'Levity').slice(0, 80),
+      body: stripInlineAttachmentMarkdown(body || 'Session updated').replace(/\s+/g, ' ').trim().slice(0, 180),
     };
     if (subtitle) {
-      alert.subtitle = String(subtitle).slice(0, 60);
+      alert.subtitle = stripInlineAttachmentMarkdown(subtitle).slice(0, 60);
     }
 
     const aps = {

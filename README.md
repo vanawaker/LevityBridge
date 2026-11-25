@@ -1,6 +1,6 @@
 # LevityBridge
 
-[English](./README.md) · [简体中文](./README.zh-CN.md) · [Website](https://spaceshuttle.xyz/levity/) · [Agent Runbook](./AGENT_INSTALL.md)
+[English](./README.md) · [简体中文](./README.zh-CN.md) · [App Store](https://apps.apple.com/app/id6836450682) · [Website](https://spaceshuttle.xyz/levity/) · [Agent Runbook](./AGENT_INSTALL.md)
 
 **LevityBridge** is the open-source companion desktop plugin for **Levity** on iPhone, iPad, and iPhone Duo.
 

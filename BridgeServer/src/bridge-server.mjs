@@ -13,6 +13,8 @@ import { URL } from 'node:url';
 import { promisify } from 'node:util';
 import { gzipSync } from 'node:zlib';
 import { ApnsPusher } from './apns-pusher.mjs';
+import { BridgeUpdater } from './bridge-updater.mjs';
+import { stripInlineAttachmentMarkdown } from './inline-attachments.mjs';
 import { MODEL_FAMILIES } from './model-catalog.mjs';
 import { generateQrSvg } from './qr-svg.mjs';
 import { QuotaMonitor } from './quota-monitor.mjs';
@@ -197,6 +199,9 @@ export class BridgeServer {
     apnsPusher = null,
     quotaMonitor = null,
     pollIntervalMs = 750,
+    bridgeUpdater = null,
+    onRequestRestart = null,
+    managedSidecar = true,
   }) {
     this.port = port;
     this.host = host;
@@ -209,6 +214,11 @@ export class BridgeServer {
     this.apnsPusher = apnsPusher || new ApnsPusher({ metaStore });
     this.quotaMonitor = quotaMonitor || new QuotaMonitor({ metaStore });
     this.pollIntervalMs = pollIntervalMs;
+    this.bridgeUpdater = bridgeUpdater ?? new BridgeUpdater({ onRequestRestart });
+    this.onRequestRestart = onRequestRestart ?? this.bridgeUpdater.onRequestRestart;
+    this.managedSidecar = managedSidecar && typeof this.onRequestRestart === 'function';
+    this.instanceId = randomUUID();
+    this.restartScheduled = false;
 
     this.seq = 0;
     this.ringBuffer = [];
@@ -225,6 +235,47 @@ export class BridgeServer {
     this._pollPending = false;
   }
 
+  #withRestartSupport(status) {
+    return !this.managedSidecar && status.canSelfUpdate
+      ? { ...status, canSelfUpdate: false, blockReason: 'manual_restart_required' }
+      : status;
+  }
+
+  #versionHandshake() {
+    const updateInfo = this.#withRestartSupport(this.bridgeUpdater.getCachedSummary());
+    return {
+      version: updateInfo.currentVersion,
+      protocolVersion: 2,
+      capabilities: ['inline_images', 'bridge_update_check', 'self_update'],
+      instanceId: this.instanceId,
+      updateInfo,
+    };
+  }
+
+  async checkBridgeUpdate(force = false) {
+    return this.#withRestartSupport(await this.bridgeUpdater.checkForUpdates({ force }));
+  }
+
+  async performBridgeUpdate() {
+    if (this.restartScheduled) {
+      return { ok: false, httpStatus: 409, status: 'already_updating', message: 'Bridge update is already in progress.' };
+    }
+    if (!this.managedSidecar) {
+      const environment = await this.bridgeUpdater.inspectEnvironment();
+      return {
+        ok: false, httpStatus: 409, status: environment.blockReason ?? 'manual_restart_required',
+        message: 'Update and restart this Bridge on the desktop.',
+      };
+    }
+    return this.bridgeUpdater.performUpdate();
+  }
+
+  scheduleRestart() {
+    if (this.restartScheduled || !this.managedSidecar) return;
+    this.restartScheduled = true;
+    setTimeout(() => this.onRequestRestart(), 450);
+  }
+
   getPairingInfo() {
     const actualPort = this.getBoundPort();
     const net = discoverNetworkAddresses(actualPort);
@@ -232,6 +283,7 @@ export class BridgeServer {
     const pairingUri = `antigravityz://pair?url=${encodeURIComponent(net.primaryUrl)}&token=${encodeURIComponent(token)}&name=${encodeURIComponent(net.hostname)}`;
     return {
       ...net,
+      ...this.#versionHandshake(),
       token,
       pairingUri,
       qrSvg: generateQrSvg(pairingUri, { margin: 2, fg: '#F8FAFC', bg: '#0B1020' }),
@@ -248,7 +300,7 @@ export class BridgeServer {
     return {
       ok: true,
       service: 'AntigravityZ Bridge',
-      version: '0.1.0',
+      ...this.#versionHandshake(),
       hostname: net.hostname,
       tailscaleIp: net.tailscaleIp,
       lanIp: net.lanIp,
@@ -290,19 +342,21 @@ export class BridgeServer {
   }
 
   async #dispatchAlert({ conversationId, title, subtitle = '', body, kind, eventKey }) {
+    const preview = body == null ? body : stripInlineAttachmentMarkdown(body);
+    const cleanSubtitle = stripInlineAttachmentMarkdown(subtitle);
     this.emitEvent('notification_event', {
       conversationId,
       notificationTitle: title,
-      notificationSubtitle: subtitle,
-      notificationBody: body,
+      notificationSubtitle: cleanSubtitle,
+      notificationBody: preview,
       notificationKind: kind,
     });
     const badgeCount = Math.max(1, this.lastUnreadCount || 0);
     await this.apnsPusher.notifyConversation({
       conversationId,
       title,
-      subtitle,
-      body,
+      subtitle: cleanSubtitle,
+      body: preview,
       kind,
       eventKey,
       badge: badgeCount,
@@ -468,15 +522,18 @@ export class BridgeServer {
   }
 
   #checkAuth(req, parsedUrl) {
-    const expected = this.metaStore.getToken();
     const authHeader = req.headers.authorization || '';
     if (authHeader.startsWith('Bearer ')) {
       const token = authHeader.slice(7).trim();
-      if (safeEqual(token, expected)) return true;
+      if (this.matchesPairingToken(token)) return true;
     }
     const qToken = parsedUrl.searchParams.get('token');
-    if (qToken && safeEqual(qToken, expected)) return true;
+    if (qToken && this.matchesPairingToken(qToken)) return true;
     return false;
+  }
+
+  matchesPairingToken(token) {
+    return typeof token === 'string' && safeEqual(token, this.metaStore.getToken());
   }
 
   #sendJson(res, status, data, req = null) {
@@ -644,7 +701,7 @@ export class BridgeServer {
               if (detail && !detail.isSubagent && !detail.pendingInteraction && !isWaitingOnBackgroundWork) {
                 const lastAssistant = [...detail.items].reverse().find((it) => it.role === 'assistant' && it.content);
                 const bodyText = lastAssistant?.content
-                  ? lastAssistant.content.replace(/[#*`>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 140)
+                  ? stripInlineAttachmentMarkdown(lastAssistant.content).replace(/[#*`>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 140)
                   : (isErrorStop ? '会话执行过程中遇到错误' : '本轮任务已完成');
                 const kind = isErrorStop ? 'error' : 'completed';
                 const subParts = [];
@@ -683,6 +740,29 @@ export class BridgeServer {
 
       if (!this.#checkAuth(req, parsedUrl)) {
         this.#sendJson(res, 401, { error: 'Unauthorized: 配对令牌无效或已过期' });
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/v1/status') {
+        this.#sendJson(res, 200, this.getPublicStatus());
+        return;
+      }
+      if (req.method === 'GET' && pathname === '/api/v1/bridge/update-status') {
+        const status = await this.checkBridgeUpdate(parsedUrl.searchParams.get('force') === '1');
+        this.#sendJson(res, 200, status, req);
+        return;
+      }
+      if (req.method === 'POST' && pathname === '/api/v1/bridge/update') {
+        const result = await this.performBridgeUpdate();
+        if (result.ok && result.restarting) {
+          // If the requesting device disconnected, there is no response left to flush.
+          if (res.destroyed) this.scheduleRestart();
+          else {
+            res.once('finish', () => this.scheduleRestart());
+            res.once('close', () => this.scheduleRestart());
+          }
+        }
+        this.#sendJson(res, result.httpStatus || (result.ok ? 200 : 400), result);
         return;
       }
 
@@ -1291,7 +1371,7 @@ export class BridgeServer {
 
   async start() {
     if (this.httpServer) return this;
-    await this.pollChanges();
+    await Promise.all([this.pollChanges(), this.bridgeUpdater.refreshEnvironment()]);
 
     this.httpServer = createServer((req, res) => {
       this.#handleHttp(req, res);

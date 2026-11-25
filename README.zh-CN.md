@@ -1,6 +1,6 @@
 # LevityBridge
 
-[English](./README.md) · [简体中文](./README.zh-CN.md) · [官方网站](https://spaceshuttle.xyz/levity/) · [Agent 自动安装手册](./AGENT_INSTALL.md)
+[English](./README.md) · [简体中文](./README.zh-CN.md) · [App Store 正式版](https://apps.apple.com/app/id6836450682) · [官方网站](https://spaceshuttle.xyz/levity/) · [Agent 自动安装手册](./AGENT_INSTALL.md)
 
 **LevityBridge** 是 **Levity**（iPhone / iPad / iPhone Duo 远程伴侣 App）的官方开源桌面端桥接插件。
 
