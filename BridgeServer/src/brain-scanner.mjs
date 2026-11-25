@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, extname, join, resolve as resolvePath, sep } from 'node:path';
+import { basename, dirname, extname, join, resolve as resolvePath, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { stripInlineAttachmentMarkdown } from './inline-attachments.mjs';
@@ -78,7 +78,22 @@ function extractAssistantInlineImages(rawContent, convDir, stepMedia = null) {
   const found = new Map();
   const resolvedConvDir = resolvePath(convDir);
   const allowedPrefix = resolvedConvDir + sep;
+  let realConvDir;
   let realConvPrefix;
+  let resolvableDirs;
+
+  const ensureRealDirs = () => {
+    if (!realConvDir) {
+      realConvDir = realpathSync(resolvedConvDir);
+      realConvPrefix = realConvDir + sep;
+      resolvableDirs = [
+        join(realConvDir, '.user_uploaded'),
+        join(realConvDir, 'uploads'),
+        realConvDir,
+        join(realConvDir, 'scratch'),
+      ];
+    }
+  };
 
   const registerPath = (cleanTarget, altText) => {
     if (!cleanTarget.startsWith('/')) return null;
@@ -88,9 +103,27 @@ function extractAssistantInlineImages(rawContent, convDir, stepMedia = null) {
     if (!fName || fName.startsWith('.') || inferAttachmentKind(fName) !== 'image') return null;
     let sizeBytes = 0;
     try {
-      realConvPrefix ??= realpathSync(resolvedConvDir) + sep;
+      ensureRealDirs();
       const realFile = realpathSync(resolved);
       if (!realFile.startsWith(realConvPrefix)) return null;
+      const parentDir = dirname(realFile);
+      if (!resolvableDirs.includes(parentDir)) return null;
+      // Ensure download resolution by basename resolves to this exact canonical file (no shadowing).
+      let matchedExact = false;
+      for (const dir of resolvableDirs) {
+        const probe = join(dir, fName);
+        if (!existsSync(probe)) continue;
+        try {
+          const probeReal = realpathSync(probe);
+          if (probeReal.startsWith(realConvPrefix) && statSync(probeReal).isFile()) {
+            matchedExact = probeReal === realFile;
+            break;
+          }
+        } catch {
+          // Ignore unreadable probe
+        }
+      }
+      if (!matchedExact) return null;
       const st = statSync(realFile);
       if (!st.isFile()) return null;
       sizeBytes = st.size;
@@ -1076,6 +1109,7 @@ export class BrainScanner {
           role: 'assistant',
           origin: 'agent',
           content,
+          ...(legacyContent !== null ? { legacyContent } : {}),
           thinking: thinking || null,
           toolCalls: mappedTools,
           attachments: assistantAtts,
@@ -2142,6 +2176,13 @@ export class BrainScanner {
 
     for (const appData of this.discoverAppDataDirs()) {
       const convDir = resolvePath(join(appData, 'brain', convId));
+      if (!existsSync(convDir)) continue;
+      let realConvPrefix;
+      try {
+        realConvPrefix = realpathSync(convDir) + sep;
+      } catch {
+        continue;
+      }
       const candidateDirs = [
         resolvePath(join(convDir, '.user_uploaded')),
         resolvePath(join(convDir, 'uploads')),
@@ -2152,7 +2193,9 @@ export class BrainScanner {
         const candidate = resolvePath(join(dir, cleanName));
         if (candidate.startsWith(dir + sep) && existsSync(candidate)) {
           try {
-            if (statSync(candidate).isFile()) return candidate;
+            const realCandidate = realpathSync(candidate);
+            if (!realCandidate.startsWith(realConvPrefix)) continue;
+            if (statSync(realCandidate).isFile()) return candidate;
           } catch {
             // Ignore unreadable file
           }

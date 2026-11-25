@@ -42,7 +42,7 @@ git -C ~/LevityBridge pull --ff-only && npm --prefix ~/LevityBridge run install-
 
 ## Features
 
-- **Zero External Dependencies**: Runs purely on Node.js (`>= 20`) built-in modules (`http`, `http2`, `crypto`, `zlib`, `fs`, `node:sqlite`).
+- **Zero External Dependencies**: Runs purely on Node.js (`>= 22.13`) built-in modules (`http`, `http2`, `crypto`, `zlib`, `fs`, `node:sqlite`).
 - **Official Plugin Lifecycle**: Integrates cleanly via Antigravity Sidecar + Hooks (`SessionStart`, `PreInvocation`, `PreToolUse`, `PostToolUse`, `PostInvocation`, `Stop`).
 - **Local-First & Private**: Sessions, thumbnails, and uploaded files travel directly between your Mac and your iOS/iPadOS device over LAN, Tailscale, or your private network. No cloud conversation storage.
 - **Fast on Cellular**: Built-in tail pagination, HTTP Gzip compression, and cached thumbnail resizing (`sips` on macOS).

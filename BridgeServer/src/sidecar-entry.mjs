@@ -71,7 +71,14 @@ async function main() {
     agentController,
     apnsPusher,
     managedSidecar: Boolean(process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR),
-    onRequestRestart: () => { bridge.stop().finally(() => process.exit(0)); },
+    onRequestRestart: () => {
+      const hardExit = setTimeout(() => process.exit(0), 2500);
+      hardExit.unref?.();
+      bridge.stop().finally(() => {
+        clearTimeout(hardExit);
+        process.exit(0);
+      });
+    },
   });
 
   await bridge.start();

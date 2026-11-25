@@ -2678,3 +2678,106 @@ test('Bridge update HTTP routes authenticate, advertise the handshake, and sched
   bridge.scheduleRestart();
   assert.equal(restarts, 1);
 });
+
+test('Bridge updater rolls back when pulled code breaks an ESM import at load time', async t => {
+  let restarts = 0;
+  const fixture = createBridgeUpdateFixture(t, { onRequestRestart: () => { restarts++; } });
+  const before = fixture.localGit('rev-parse', 'HEAD');
+  fixture.publish('1.2.0', "import './missing-module.mjs';\nexport const version = '1.2.0';\n");
+  const result = await fixture.updater.performUpdate();
+  assert.equal(result.ok, false);
+  assert.equal(result.httpStatus, 500);
+  assert.equal(result.status, 'rolled_back');
+  assert.equal(result.restarting, false);
+  assert.equal(fixture.localGit('rev-parse', 'HEAD'), before);
+  assert.equal(restarts, 0);
+});
+
+test('Bridge updater marks failed offline checks and detects release ahead of unchanged branch', async t => {
+  const fixture = createBridgeUpdateFixture(t, {
+    fetchFn: async () => { throw new Error('offline'); },
+  });
+  // Make origin unreachable to simulate offline failure for both release API and git fetch
+  fixture.localGit('remote', 'set-url', 'origin', '/nonexistent/levity-offline-origin.git');
+  const failed = await fixture.updater.checkForUpdates({ force: true });
+  assert.equal(failed.checkFailed, true);
+  assert.equal(failed.checkedAt, null);
+
+  // Now simulate GitHub release 1.2.0 ahead while tracked git branch has 0 commits behind
+  const branchFixture = createBridgeUpdateFixture(t, {
+    fetchFn: async () => ({
+      ok: true,
+      json: async () => ({ tag_name: 'v1.2.0', body: 'Release 1.2.0', html_url: 'https://example.invalid/1.2.0' }),
+    }),
+  });
+  const checked = await branchFixture.updater.checkForUpdates({ force: true });
+  assert.equal(checked.checkFailed, false);
+  assert.equal(checked.updateAvailable, true);
+  assert.equal(checked.canSelfUpdate, false);
+  assert.equal(checked.blockReason, 'branch_not_ahead');
+  const applied = await branchFixture.updater.performUpdate();
+  assert.equal(applied.ok, false);
+  assert.equal(applied.httpStatus, 409);
+  assert.equal(applied.status, 'branch_not_ahead');
+});
+
+test('BrainScanner enforces symlink containment on downloads and skips unresolvable nested inline images', async t => {
+  const { convDir, writeTranscript, scanner, convId, reply } = createReadCursorFixture(t);
+  const outside = `${convDir}-outside`;
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(join(outside, 'secret.png'), 'secret bytes');
+  const escapedLink = join(convDir, 'leak.png');
+  symlinkSync(join(outside, 'secret.png'), escapedLink);
+  assert.equal(scanner.resolveUploadedFilePath(convId, 'leak.png'), null);
+
+  const nestedDir = join(convDir, 'screens');
+  mkdirSync(nestedDir, { recursive: true });
+  const nestedImg = join(nestedDir, 'nested.png');
+  writeFileSync(nestedImg, 'nested bytes');
+  const rootImg = join(convDir, 'root.png');
+  writeFileSync(rootImg, 'root bytes');
+  writeTranscript([{
+    ...reply,
+    content: `![Nested](${nestedImg})\n![Root](${rootImg})`,
+  }], new Date(reply.created_at));
+  const detail = await scanner.getConversationDetail(convId);
+  const assistant = detail.items.find((it) => it.role === 'assistant');
+  assert.ok(assistant.content.includes('![Root](levity-attachment://root.png)'));
+  assert.ok(!assistant.content.includes('levity-attachment://nested.png'));
+  assert.deepEqual(assistant.attachments.map((a) => a.fileName), ['root.png']);
+});
+
+test('BridgeServer negotiates inline_images capability so legacy 1.0(19) clients receive clean legacy text', async t => {
+  const { convDir, writeTranscript, metaStore, scanner, convId, reply } = createReadCursorFixture(t);
+  const img = join(convDir, 'shot.png');
+  writeFileSync(img, 'png bytes');
+  writeTranscript([{
+    ...reply,
+    content: `Intro\n\`\`\`\`carousel\n![Shot](${img})\n\`\`\`\`\nOutro`,
+  }], new Date(reply.created_at));
+
+  const bridge = new BridgeServer({
+    port: 0,
+    host: '127.0.0.1',
+    metaStore,
+    brainScanner: scanner,
+    agentController: { isAvailable: () => false },
+  });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  const base = `http://127.0.0.1:${bridge.getBoundPort()}`;
+  const auth = { Authorization: `Bearer ${metaStore.getToken()}` };
+
+  const legacyRes = await fetch(`${base}/api/v1/conversations/${convId}`, { headers: auth }).then((r) => r.json());
+  const legacyItem = legacyRes.detail.items.find((it) => it.role === 'assistant');
+  assert.ok(!legacyItem.content.includes('levity-attachment://'));
+  assert.equal(legacyItem.legacyContent, undefined);
+  assert.deepEqual(legacyItem.attachments.map((a) => a.fileName), ['shot.png']);
+
+  const modernRes = await fetch(`${base}/api/v1/conversations/${convId}`, {
+    headers: { ...auth, 'X-Levity-Capabilities': 'inline_images' },
+  }).then((r) => r.json());
+  const modernItem = modernRes.detail.items.find((it) => it.role === 'assistant');
+  assert.ok(modernItem.content.includes('![Shot](levity-attachment://shot.png)'));
+  assert.equal(modernItem.legacyContent, undefined);
+});

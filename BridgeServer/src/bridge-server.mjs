@@ -318,6 +318,25 @@ export class BridgeServer {
     return typeof addr === 'object' && addr ? addr.port : this.port;
   }
 
+  #clientSupportsInlineImages(req, parsedUrl) {
+    const rawHeader = String(req?.headers?.['x-levity-capabilities'] || '').toLowerCase();
+    if (rawHeader && rawHeader.split(/[,\s]+/).includes('inline_images')) return true;
+    const qCaps = String(parsedUrl?.searchParams?.get('capabilities') || '').toLowerCase();
+    if (qCaps && qCaps.split(/[,\s]+/).includes('inline_images')) return true;
+    return parsedUrl?.searchParams?.get('inlineImages') === '1';
+  }
+
+  #serializeEventForClient(envelope, supportsInlineImages) {
+    if (!Object.prototype.hasOwnProperty.call(envelope, '_legacyDetail')) {
+      return envelope;
+    }
+    const { _legacyDetail, detail, ...rest } = envelope;
+    return {
+      ...rest,
+      detail: supportsInlineImages ? detail : (_legacyDetail ?? detail),
+    };
+  }
+
   emitEvent(type, payload = {}) {
     this.seq += 1;
     const envelope = {
@@ -330,15 +349,25 @@ export class BridgeServer {
     if (this.ringBuffer.length > RING_BUFFER_LIMIT) {
       this.ringBuffer.shift();
     }
-    const frame = encodeWsText(envelope);
+    let modernFrame = null;
+    let legacyFrame = null;
     for (const client of this.wsClients) {
       try {
+        const supportsInline = Boolean(client.supportsInlineImages);
+        let frame;
+        if (supportsInline) {
+          modernFrame ??= encodeWsText(this.#serializeEventForClient(envelope, true));
+          frame = modernFrame;
+        } else {
+          legacyFrame ??= encodeWsText(this.#serializeEventForClient(envelope, false));
+          frame = legacyFrame;
+        }
         client.socket.write(frame);
       } catch {
         this.wsClients.delete(client);
       }
     }
-    return envelope;
+    return this.#serializeEventForClient(envelope, true);
   }
 
   async #dispatchAlert({ conversationId, title, subtitle = '', body, kind, eventKey }) {
@@ -403,7 +432,8 @@ export class BridgeServer {
               this.emitEvent('conversation_updated', {
                 conversationId: conv.id,
                 summary: conv,
-                detail: detail ? this.#stripPrivateDetail(detail) : null,
+                detail: detail ? this.#stripPrivateDetail(detail, { supportsInlineImages: true }) : null,
+                _legacyDetail: detail ? this.#stripPrivateDetail(detail, { supportsInlineImages: false }) : null,
               });
             }
           } else if (prevFp !== fp) {
@@ -413,7 +443,8 @@ export class BridgeServer {
             this.emitEvent('conversation_updated', {
               conversationId: conv.id,
               summary: conv,
-              detail: detail ? this.#stripPrivateDetail(detail) : null,
+              detail: detail ? this.#stripPrivateDetail(detail, { supportsInlineImages: true }) : null,
+              _legacyDetail: detail ? this.#stripPrivateDetail(detail, { supportsInlineImages: false }) : null,
             });
           }
 
@@ -480,7 +511,7 @@ export class BridgeServer {
     }
   }
 
-  #stripPrivateDetail(detail, { limit = 30 } = {}) {
+  #stripPrivateDetail(detail, { limit = 30, supportsInlineImages = false } = {}) {
     const { convDir, detectedModelId, hasPendingBackgroundTasks, notFullyIdle, items = [], ...rest } = detail;
     const totalItemCount = items.length;
     const sliced = limit && limit > 0 && totalItemCount > limit ? items.slice(-limit) : items;
@@ -489,21 +520,29 @@ export class BridgeServer {
       const isRecent = idx >= len - 6;
       const maxThinking = isRecent ? 2400 : 800;
       const maxToolOut = isRecent ? 900 : 450;
-      let changed = false;
-      let thinking = it.thinking;
+      const { legacyContent, ...publicItem } = it;
+      let changed = legacyContent !== undefined;
+      let content = publicItem.content;
+      if (!supportsInlineImages && typeof legacyContent === 'string') {
+        content = legacyContent;
+        changed = true;
+      }
+      let thinking = publicItem.thinking;
       if (typeof thinking === 'string' && thinking.length > maxThinking) {
         thinking = `${thinking.slice(0, maxThinking)}\n…`;
         changed = true;
       }
-      let toolCalls = it.toolCalls;
+      let toolCalls = publicItem.toolCalls;
       if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+        let toolOutTruncated = false;
         for (const tc of toolCalls) {
           if (typeof tc.outputPreview === 'string' && tc.outputPreview.length > maxToolOut) {
-            changed = true;
+            toolOutTruncated = true;
             break;
           }
         }
-        if (changed) {
+        if (toolOutTruncated) {
+          changed = true;
           toolCalls = toolCalls.map((tc) =>
             typeof tc.outputPreview === 'string' && tc.outputPreview.length > maxToolOut
               ? { ...tc, outputPreview: `${tc.outputPreview.slice(0, maxToolOut)}\n…` }
@@ -511,7 +550,7 @@ export class BridgeServer {
           );
         }
       }
-      return changed ? { ...it, thinking, toolCalls } : it;
+      return changed ? { ...publicItem, content, thinking, toolCalls } : publicItem;
     });
     return {
       ...rest,
@@ -938,9 +977,10 @@ export class BridgeServer {
         const detail = result.conversationId
           ? await this.brainScanner.getConversationDetail(result.conversationId)
           : null;
+        const supportsInlineImages = this.#clientSupportsInlineImages(req, parsedUrl);
         this.#sendJson(res, 201, {
           ...result,
-          detail: detail ? this.#stripPrivateDetail(detail) : null,
+          detail: detail ? this.#stripPrivateDetail(detail, { supportsInlineImages }) : null,
         });
         return;
       }
@@ -964,9 +1004,10 @@ export class BridgeServer {
           this.#sendJson(res, 404, { error: '未找到该会话' }, req);
           return;
         }
+        const supportsInlineImages = this.#clientSupportsInlineImages(req, parsedUrl);
         const quota = await this.quotaMonitor.getSnapshot();
         this.#sendJson(res, 200, {
-          detail: this.#stripPrivateDetail(detail, { limit }),
+          detail: this.#stripPrivateDetail(detail, { limit, supportsInlineImages }),
           quota,
           currentSeq: this.seq,
         }, req);
@@ -1050,7 +1091,8 @@ export class BridgeServer {
         const detail = await this.brainScanner.getConversationDetail(convId);
         this.emitEvent('conversation_updated', {
           conversationId: convId,
-          detail: detail ? this.#stripPrivateDetail(detail) : null,
+          detail: detail ? this.#stripPrivateDetail(detail, { supportsInlineImages: true }) : null,
+          _legacyDetail: detail ? this.#stripPrivateDetail(detail, { supportsInlineImages: false }) : null,
         });
 
         this.#sendJson(res, 200, {
@@ -1078,14 +1120,16 @@ export class BridgeServer {
         }
         await this.pollChanges();
         const detail = await this.brainScanner.getConversationDetail(convId);
+        const supportsInlineImages = this.#clientSupportsInlineImages(req, parsedUrl);
         this.emitEvent('conversation_updated', {
           conversationId: convId,
-          detail: detail ? this.#stripPrivateDetail(detail) : null,
+          detail: detail ? this.#stripPrivateDetail(detail, { supportsInlineImages: true }) : null,
+          _legacyDetail: detail ? this.#stripPrivateDetail(detail, { supportsInlineImages: false }) : null,
         });
         this.#sendJson(res, 200, {
           ok: true,
           meta: updatedMeta,
-          detail: detail ? this.#stripPrivateDetail(detail) : null,
+          detail: detail ? this.#stripPrivateDetail(detail, { supportsInlineImages }) : null,
           currentSeq: this.seq,
         });
         return;
@@ -1229,6 +1273,7 @@ export class BridgeServer {
     const client = {
       id: randomUUID(),
       deviceId: null,
+      supportsInlineImages: this.#clientSupportsInlineImages(req, parsedUrl),
       socket,
       connectedAt: Date.now(),
       buffer: Buffer.alloc(0),
@@ -1268,7 +1313,7 @@ export class BridgeServer {
       } else {
         for (const ev of this.ringBuffer) {
           if (ev.seq > sinceSeq) {
-            socket.write(encodeWsText(ev));
+            socket.write(encodeWsText(this.#serializeEventForClient(ev, client.supportsInlineImages)));
           }
         }
       }
@@ -1420,8 +1465,20 @@ export class BridgeServer {
     }
     this.wsClients.clear();
     if (this.httpServer) {
-      await new Promise((resolve) => this.httpServer.close(() => resolve()));
+      const server = this.httpServer;
       this.httpServer = null;
+      server.closeIdleConnections?.();
+      await new Promise((resolve) => {
+        const forceClose = setTimeout(() => {
+          server.closeAllConnections?.();
+          resolve();
+        }, 1500);
+        forceClose.unref?.();
+        server.close(() => {
+          clearTimeout(forceClose);
+          resolve();
+        });
+      });
     }
   }
 }

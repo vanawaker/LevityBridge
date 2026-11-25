@@ -4,11 +4,11 @@
 
 ## Prerequisites Check
 
-1. Check that `node` (`>= 20`) and `git` are installed:
+1. Check that `node` (`>= 22.13`, required for built-in `node:sqlite`) and `git` are installed:
    ```bash
    node -v && git --version
    ```
-   - If Node.js `< 20` or missing on macOS, offer to install it via Homebrew (`brew install node`) or ask the user before installing.
+   - If Node.js `< 22.13` or missing on macOS, offer to install it via Homebrew (`brew install node`) or ask the user before installing.
 
 ## Installation Steps
 

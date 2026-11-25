@@ -1,5 +1,8 @@
 let latestPairingUri = '';
 let pairingToken = '';
+let currentInstanceId = '';
+let restartingFromInstanceId = null;
+let pendingUpdateWarning = '';
 
 async function refreshStatus() {
   try {
@@ -8,6 +11,15 @@ async function refreshStatus() {
     const data = await res.json();
     latestPairingUri = data.pairingUri || '';
     pairingToken = data.token || '';
+    const nextInstanceId = data.instanceId || '';
+    if (restartingFromInstanceId && nextInstanceId && nextInstanceId !== restartingFromInstanceId) {
+      restartingFromInstanceId = null;
+      const versionText = data.version ? ` v${data.version}` : '';
+      const suffix = pendingUpdateWarning ? `（${pendingUpdateWarning}）` : '';
+      pendingUpdateWarning = '';
+      showBridgeFeedback(`桌面桥接已更新至${versionText} ✓${suffix}`);
+    }
+    if (nextInstanceId) currentInstanceId = nextInstanceId;
     document.getElementById('bridge-version').textContent = data.version ? `v${data.version}` : '';
     document.getElementById('qr-container').innerHTML = data.qrSvg || '';
     document.getElementById('ts-addr').textContent = data.tailscaleIp
@@ -90,7 +102,14 @@ updateBridge.addEventListener('click', async () => {
       showBridgeFeedback(result.message || '更新未完成，请在电脑端检查桥接。');
     } else {
       updateBridge.hidden = true;
-      showBridgeFeedback(result.restarting ? '桌面桥接正在重启…' : '桌面桥接已是最新版本');
+      const warn = result.warning ? `（${result.warning}）` : '';
+      if (result.restarting) {
+        restartingFromInstanceId = currentInstanceId || '__restarting__';
+        pendingUpdateWarning = result.warning || '';
+        showBridgeFeedback(`桌面桥接正在重启…${warn}`);
+      } else {
+        showBridgeFeedback(`桌面桥接已是最新版本${warn}`);
+      }
     }
   } catch {
     showBridgeFeedback('暂时无法确认更新结果，请重新检查。');

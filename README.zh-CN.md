@@ -42,7 +42,7 @@ git -C ~/LevityBridge pull --ff-only && npm --prefix ~/LevityBridge run install-
 
 ## 核心特性
 
-- **零第三方依赖**：纯 Node.js（`>= 20`）原生模块实现，安全可审计。
+- **零第三方依赖**：纯 Node.js（`>= 22.13`）原生模块实现，安全可审计。
 - **标准插件架构**：基于 Antigravity 官方 Sidecar 侧栏与生命周期 Hooks 接入，支持二维码一键配对与实时会话同步。
 - **本地直连保护隐私**：所有聊天记录、附件与配对凭据仅在你的电脑与移动设备间通过局域网或 Tailscale 等私有网络直连传输，不经过开发者云端存储。
 - **蜂窝网络极速体验**：内置尾部按需分页、HTTP Gzip 压缩与缩略图缓存。

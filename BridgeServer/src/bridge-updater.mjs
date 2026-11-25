@@ -1,13 +1,17 @@
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const defaultRepoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const defaultFeed = 'https://api.github.com/repos/vanawaker/LevityBridge/releases/latest';
 const coreFiles = [
   'sidecar-entry.mjs', 'bridge-server.mjs', 'brain-scanner.mjs', 'agent-controller.mjs',
   'bridge-updater.mjs', 'apns-pusher.mjs', 'meta-store.mjs', 'inline-attachments.mjs',
+];
+const importableModules = [
+  'bridge-server.mjs', 'brain-scanner.mjs', 'agent-controller.mjs', 'bridge-updater.mjs',
+  'apns-pusher.mjs', 'meta-store.mjs', 'inline-attachments.mjs',
 ];
 
 const semver = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/i;
@@ -163,15 +167,21 @@ export class BridgeUpdater {
     const currentVersion = this.currentVersion;
     const latestVersion = this.lastCheck?.latestVersion ?? null;
     const commitsBehind = this.lastCheck?.commitsBehind ?? 0;
+    const releaseAhead = compareSemver(latestVersion, currentVersion) > 0;
+    const updateAvailable = releaseAhead || commitsBehind > 0;
+    const branchChecked = this.lastCheck?.branchChecked === true;
+    const branchNotAhead = branchChecked && releaseAhead && commitsBehind === 0;
+    const baseCanSelfUpdate = this.environment?.canSelfUpdate ?? false;
     return {
       currentVersion,
       latestVersion,
       commitsBehind,
-      updateAvailable: compareSemver(latestVersion, currentVersion) > 0 || commitsBehind > 0,
-      canSelfUpdate: this.environment?.canSelfUpdate ?? false,
+      updateAvailable,
+      canSelfUpdate: baseCanSelfUpdate && !branchNotAhead,
       installKind: this.environment?.installKind ?? null,
-      blockReason: this.environment?.blockReason ?? null,
+      blockReason: this.environment?.blockReason ?? (branchNotAhead ? 'branch_not_ahead' : null),
       checkedAt: this.lastCheck?.checkedAt ?? null,
+      checkFailed: Boolean(this.lastCheckFailed),
       updating: this.updating,
     };
   }
@@ -203,28 +213,32 @@ export class BridgeUpdater {
         headers: { 'User-Agent': `LevityBridge/${currentVersion}`, Accept: 'application/vnd.github+json' },
         signal: controller.signal,
       });
-      if (!response.ok) return {};
+      if (!response.ok) return { ok: false };
       const release = await response.json();
       return {
+        ok: true,
         latestVersion: parseSemver(release?.tag_name) ? release.tag_name.trim().replace(/^v/i, '') : null,
         releaseNotes: typeof release?.body === 'string' ? release.body : null,
         releaseUrl: typeof release?.html_url === 'string' ? release.html_url : null,
       };
     } catch {
-      return {};
+      return { ok: false };
     } finally {
       clearTimeout(timeout);
     }
   }
 
   async #commitsBehind(environment) {
-    if (environment.installKind !== 'git' || !environment.remoteExists || environment.branch === 'HEAD') return 0;
+    if (environment.installKind !== 'git' || !environment.remoteExists || environment.branch === 'HEAD') {
+      return { ok: false, checked: false, count: 0 };
+    }
     try {
       await this.#git(['fetch', '--tags', '--quiet', 'origin'], 15_000);
       const upstream = await this.#upstream(environment.branch);
-      return Number(await this.#git(['rev-list', '--count', `HEAD..${upstream}`])) || 0;
+      const count = Number(await this.#git(['rev-list', '--count', `HEAD..${upstream}`])) || 0;
+      return { ok: true, checked: true, count };
     } catch {
-      return this.lastCheck?.commitsBehind ?? 0;
+      return { ok: false, checked: false, count: this.lastCheck?.commitsBehind ?? 0 };
     }
   }
 
@@ -237,18 +251,30 @@ export class BridgeUpdater {
 
     if (process.env.LEVITY_UPDATE_CHECK === 'off') {
       this.lastCheck = null;
+      this.lastCheckFailed = false;
       return this.#status();
     }
-    if (!force && this.lastCheck && this.nowFn() - Date.parse(this.lastCheck.checkedAt) < this.checkTtlMs) {
+    if (!force && this.lastCheck && !this.lastCheckFailed && this.nowFn() - Date.parse(this.lastCheck.checkedAt) < this.checkTtlMs) {
       return this.#status();
     }
 
-    const [release, commitsBehind] = await Promise.all([
+    const [release, gitProbe] = await Promise.all([
       this.#latestRelease(this.currentVersion),
-      force ? this.#commitsBehind(environment) : this.lastCheck?.commitsBehind ?? 0,
+      force ? this.#commitsBehind(environment) : Promise.resolve({ ok: false, checked: false, count: this.lastCheck?.commitsBehind ?? 0 }),
     ]);
     if (generation === this.checkGeneration) {
-      this.lastCheck = { ...release, commitsBehind, checkedAt: new Date(this.nowFn()).toISOString() };
+      const anySucceeded = Boolean(release.ok || gitProbe.ok);
+      this.lastCheckFailed = !anySucceeded;
+      if (anySucceeded) {
+        this.lastCheck = {
+          latestVersion: release.ok ? release.latestVersion : (this.lastCheck?.latestVersion ?? null),
+          releaseNotes: release.ok ? release.releaseNotes : (this.lastCheck?.releaseNotes ?? null),
+          releaseUrl: release.ok ? release.releaseUrl : (this.lastCheck?.releaseUrl ?? null),
+          commitsBehind: gitProbe.ok ? gitProbe.count : (this.lastCheck?.commitsBehind ?? 0),
+          branchChecked: gitProbe.checked || Boolean(this.lastCheck?.branchChecked),
+          checkedAt: new Date(this.nowFn()).toISOString(),
+        };
+      }
     }
     return this.#status();
   }
@@ -277,6 +303,14 @@ export class BridgeUpdater {
     const [ahead, behind] = (await this.#git(['rev-list', '--left-right', '--count', `${previousHead}...${target}`]))
       .split(/\s+/).map(Number);
     if (behind === 0) {
+      if (compareSemver(this.lastCheck?.latestVersion, previousVersion) > 0) {
+        if (this.lastCheck) this.lastCheck = { ...this.lastCheck, commitsBehind: 0, branchChecked: true };
+        return failure('branch_not_ahead', 'The latest release is not yet on the tracked Git branch. Update manually on your desktop.', {
+          previousVersion,
+          currentVersion: previousVersion,
+          newVersion: previousVersion,
+        });
+      }
       return {
         ok: true, httpStatus: 200, status: 'already_up_to_date', currentVersion: previousVersion,
         previousVersion, newVersion: previousVersion, restarting: false,
@@ -293,6 +327,7 @@ export class BridgeUpdater {
     if (beforeMerge.branch !== environment.branch || await this.#git(['rev-parse', 'HEAD']) !== previousHead) {
       return failure('merge_failed', 'The checkout changed during the update. Check it before retrying.', { previousVersion });
     }
+    const presentCoreBefore = coreFiles.filter((file) => existsSync(join(this.repoRoot, 'BridgeServer', 'src', file)));
     try {
       await this.#git(['merge', '--ff-only', '--no-overwrite-ignore', target], 15_000);
     } catch {
@@ -300,9 +335,39 @@ export class BridgeUpdater {
     }
 
     try {
-      for (const file of coreFiles) {
+      for (const file of presentCoreBefore) {
         const path = join(this.repoRoot, 'BridgeServer', 'src', file);
-        if (existsSync(path)) await this.#run(process.execPath, ['--check', path]);
+        if (!existsSync(path)) {
+          throw new Error(`Required Bridge file removed by update: ${file}`);
+        }
+      }
+      const presentCoreAfter = coreFiles.filter((file) => existsSync(join(this.repoRoot, 'BridgeServer', 'src', file)));
+      for (const file of presentCoreAfter) {
+        const path = join(this.repoRoot, 'BridgeServer', 'src', file);
+        await this.#run(process.execPath, ['--check', path]);
+      }
+      const importUrls = importableModules
+        .map((file) => join(this.repoRoot, 'BridgeServer', 'src', file))
+        .filter((path) => existsSync(path))
+        .map((path) => pathToFileURL(path).href);
+      if (importUrls.length > 0) {
+        // Verify the live ESM import graph and exports in a clean child process before restarting.
+        await this.#run(
+          process.execPath,
+          ['--input-type=module', '-e', 'for (const url of process.argv.slice(1)) { await import(url); }', ...importUrls],
+          10_000
+        );
+      }
+      // Also confirm sidecar-entry.mjs relative static imports resolve on disk (both `import ... from './x'` and `import './x'`).
+      const sidecarPath = join(this.repoRoot, 'BridgeServer', 'src', 'sidecar-entry.mjs');
+      if (existsSync(sidecarPath)) {
+        const sidecarSrc = readFileSync(sidecarPath, 'utf8');
+        for (const match of sidecarSrc.matchAll(/^\s*import\s+(?:[\s\S]*?\s+from\s+)?['"](\.[^'"]+)['"]/gm)) {
+          const relPath = join(this.repoRoot, 'BridgeServer', 'src', match[1]);
+          if (!existsSync(relPath)) {
+            throw new Error(`Missing sidecar import: ${match[1]}`);
+          }
+        }
       }
     } catch {
       try {

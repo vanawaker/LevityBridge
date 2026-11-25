@@ -10,6 +10,6 @@
     "test": "node --test tests/bridge.test.mjs"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.13.0"
   }
 }
