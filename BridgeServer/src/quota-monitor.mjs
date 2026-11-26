@@ -7,6 +7,7 @@
 import { MODEL_FAMILIES } from './model-catalog.mjs';
 
 function clampFraction(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
   const n = Number(raw);
   if (!Number.isFinite(n)) return null;
   return Math.max(0, Math.min(1, n));
@@ -147,8 +148,8 @@ export class QuotaMonitor {
       const primaryFrac = fiveHFrac !== null ? fiveHFrac : weeklyFrac;
       const remainingFraction = Number(primaryFrac.toFixed(4));
       const remainingPercent = Math.round(primaryFrac * 100);
-      const resetTime = fiveHBucket?.resetTime
-        ? String(fiveHBucket.resetTime)
+      const resetTime = fiveHFrac !== null
+        ? (fiveHBucket?.resetTime ? String(fiveHBucket.resetTime) : null)
         : (weeklyBucket?.resetTime ? String(weeklyBucket.resetTime) : null);
 
       const weeklyFraction = weeklyFrac !== null ? Number(weeklyFrac.toFixed(4)) : null;
@@ -196,14 +197,15 @@ export class QuotaMonitor {
       const poolKey = fam.provider === 'anthropic' || fam.provider === 'oss' ? 'claude_gpt' : 'gemini';
       const pool = summaryPools.get(poolKey);
       if (!pool) continue;
+      const usePoolPrimary = pool.remainingFraction !== null && pool.remainingFraction !== undefined;
       for (const variant of fam.variants) {
         const existing = byModelId[variant.id];
         byModelId[variant.id] = {
           id: variant.id,
           label: variant.displayName,
-          remainingFraction: existing?.remainingFraction ?? pool.remainingFraction,
-          remainingPercent: existing?.remainingPercent ?? pool.remainingPercent,
-          resetTime: existing?.resetTime ?? pool.resetTime,
+          remainingFraction: usePoolPrimary ? pool.remainingFraction : (existing?.remainingFraction ?? null),
+          remainingPercent: usePoolPrimary ? pool.remainingPercent : (existing?.remainingPercent ?? null),
+          resetTime: usePoolPrimary ? pool.resetTime : (existing?.resetTime ?? null),
           weeklyFraction: pool.weeklyFraction,
           weeklyPercent: pool.weeklyPercent,
           weeklyResetTime: pool.weeklyResetTime,

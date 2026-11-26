@@ -13,16 +13,23 @@ import { URL } from 'node:url';
 import { promisify } from 'node:util';
 import { gzipSync } from 'node:zlib';
 import { ApnsPusher } from './apns-pusher.mjs';
+import { LEAKED_ASSISTANT_PREVIEW_FALLBACK, sanitizeAssistantLeakedTail } from './brain-scanner.mjs';
 import { BridgeUpdater } from './bridge-updater.mjs';
 import { stripInlineAttachmentMarkdown } from './inline-attachments.mjs';
 import { MODEL_FAMILIES } from './model-catalog.mjs';
 import { generateQrSvg } from './qr-svg.mjs';
 import { QuotaMonitor } from './quota-monitor.mjs';
+import {
+  canonicalWorkspacePath, findWorkspaceDirectory, listWorkspaceDirectories, localWorkspacePath,
+  matchingDesktopProjects, openWorkspaceDirectory, resolveWorkspaceDirectory, WorkspaceError,
+  workspaceLocations, workspacePathMetadata,
+} from './workspace-paths.mjs';
 
 const execFileAsync = promisify(execFile);
 const THUMB_CACHE_DIR = join(tmpdir(), 'antigravityz-thumbs');
 const THUMB_SUPPORTED_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.heic']);
 const inflightThumbs = new Map();
+const WORKSPACE_METHODS = { suggestions: 'GET', list: 'POST', resolve: 'POST', favorites: 'POST' };
 
 async function ensureCachedThumbnail(sourcePath, st) {
   const ext = extname(sourcePath).toLowerCase();
@@ -246,7 +253,7 @@ export class BridgeServer {
     return {
       version: updateInfo.currentVersion,
       protocolVersion: 2,
-      capabilities: ['inline_images', 'bridge_update_check', 'self_update'],
+      capabilities: ['inline_images', 'bridge_update_check', 'self_update', 'workspace_browser'],
       instanceId: this.instanceId,
       updateInfo,
     };
@@ -412,7 +419,7 @@ export class BridgeServer {
 
   async #runSinglePollChanges() {
     try {
-      const scan = await this.brainScanner.scanAll({ includeMetadata: false });
+      const scan = await this.brainScanner.scanAll({ includeMetadata: false, includeKnownProjects: false });
       this.lastUnreadCount = typeof scan.unreadCount === 'number' ? scan.unreadCount : 0;
       let listChanged = false;
       const seenIds = new Set();
@@ -560,12 +567,14 @@ export class BridgeServer {
     };
   }
 
+  #checkBearerAuth(req) {
+    const header = /^Bearer +([^\s]+)$/i.exec(req.headers.authorization || '');
+    return Boolean(header && this.matchesPairingToken(header[1]));
+  }
+
   #checkAuth(req, parsedUrl) {
     const authHeader = req.headers.authorization || '';
-    if (authHeader.startsWith('Bearer ')) {
-      const token = authHeader.slice(7).trim();
-      if (this.matchesPairingToken(token)) return true;
-    }
+    if (authHeader.startsWith('Bearer ') && this.matchesPairingToken(authHeader.slice(7).trim())) return true;
     const qToken = parsedUrl.searchParams.get('token');
     if (qToken && this.matchesPairingToken(qToken)) return true;
     return false;
@@ -624,7 +633,116 @@ export class BridgeServer {
     return this.metaStore.markConversationViewed(String(convId), viewedMs, cursor);
   }
 
+  #workspaceDesktopBinding(desktopProjects, path) {
+    const matches = matchingDesktopProjects(desktopProjects, path);
+    return {
+      desktopProjectId: matches[0]?.id ?? null,
+      desktopProjectName: matches[0]?.name ?? null,
+      matchingDesktopProjects: matches.map(({ id, name }) => ({ id, name })),
+    };
+  }
+
+  #workspaceReferences(paths, desktopProjects, includeUnavailable = false) {
+    const result = [];
+    for (const path of paths) {
+      if (typeof path !== 'string') continue;
+      const directory = findWorkspaceDirectory(path);
+      if (!directory && !includeUnavailable) continue;
+      const metadata = workspacePathMetadata(directory?.resolvedPath || path);
+      const { desktopProjectId, desktopProjectName } = this.#workspaceDesktopBinding(desktopProjects, metadata.path);
+      result.push({ ...metadata, available: Boolean(directory), desktopProjectId, desktopProjectName });
+    }
+    return result;
+  }
+
+  async #handleWorkspaceRequest(req, res, route) {
+    const send = (status, data) => this.#sendJson(res, status, data, req);
+    if (!this.#checkBearerAuth(req)) {
+      send(401, { error: 'Unauthorized: 配对令牌无效或已过期', code: 'UNAUTHORIZED' });
+      return;
+    }
+    try {
+      if (!Object.hasOwn(WORKSPACE_METHODS, route)) {
+        throw new WorkspaceError('NOT_FOUND', 'Not Found');
+      }
+      const method = WORKSPACE_METHODS[route];
+      if (req.method !== method) {
+        res.setHeader('Allow', method);
+        throw new WorkspaceError('METHOD_NOT_ALLOWED', 'Method Not Allowed', 405);
+      }
+      const { favorites, recents } = this.metaStore.listWorkspacePaths();
+      const desktopProjects = this.brainScanner.readDesktopProjects();
+      const projectsRoot = this.brainScanner.projectsRoot;
+      if (route === 'suggestions') {
+        send(200, {
+          favorites: this.#workspaceReferences(favorites, desktopProjects, true),
+          recents: this.#workspaceReferences(recents, desktopProjects),
+          desktopProjects: [...desktopProjects.values()],
+          knownProjects: this.brainScanner.listKnownProjectFolders({ desktopProjects }),
+          locations: workspaceLocations(projectsRoot),
+        });
+        return;
+      }
+
+      let body;
+      try {
+        body = await this.#readJsonBody(req);
+      } catch {
+        throw new WorkspaceError('INVALID_REQUEST', '请求体必须是有效的 JSON 对象', 400);
+      }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        throw new WorkspaceError('INVALID_REQUEST', '请求体必须是有效的 JSON 对象', 400);
+      }
+      if (route === 'favorites') {
+        if (body.action !== 'add' && body.action !== 'remove') {
+          throw new WorkspaceError('INVALID_REQUEST', 'action 必须为 add 或 remove', 400);
+        }
+        // Allow removing a saved path even if the directory or drive is gone.
+        const path = body.action === 'add'
+          ? resolveWorkspaceDirectory(body.path, { checkAccess: true }).resolvedPath
+          : canonicalWorkspacePath(localWorkspacePath(body.path));
+        this.metaStore.setWorkspaceFavorite(path, body.action === 'add');
+        send(200, { favorites: this.#workspaceReferences(this.metaStore.listWorkspacePaths().favorites, desktopProjects, true) });
+        return;
+      }
+
+      const path = route === 'list' && (body.path == null || body.path === '')
+        ? projectsRoot || '~'
+        : body.path;
+      const directory = resolveWorkspaceDirectory(path, { checkAccess: route === 'resolve' });
+      const favoritePaths = new Set(favorites);
+      const { matchingDesktopProjects: matches, ...binding } = this.#workspaceDesktopBinding(desktopProjects, directory.resolvedPath);
+      const metadata = { ...directory, isFavorite: favoritePaths.has(directory.resolvedPath), ...binding };
+      if (route === 'resolve') {
+        const dir = await openWorkspaceDirectory(directory.resolvedPath);
+        await dir.close();
+        send(200, { ...metadata, matchingDesktopProjects: matches });
+        return;
+      }
+
+      const { filter = '', showHidden = false, limit = 100 } = body;
+      if (typeof filter !== 'string' || typeof showHidden !== 'boolean' || !Number.isInteger(limit) || limit < 1) {
+        throw new WorkspaceError('INVALID_REQUEST', 'filter、showHidden 或 limit 参数无效', 400);
+      }
+      const children = await listWorkspaceDirectories(directory, { filter, showHidden, limit: Math.min(limit, 200) }, favoritePaths);
+      send(200, { ...metadata, isRoot: directory.path === '/', ...children });
+    } catch (error) {
+      if (error instanceof WorkspaceError) {
+        send(error.status, { error: error.message, code: error.code });
+      } else {
+        send(500, { error: '无法处理目录请求', code: 'INTERNAL_ERROR' });
+      }
+    }
+  }
+
   async #handleHttp(req, res) {
+    const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const pathname = parsedUrl.pathname;
+    const workspacePrefix = '/api/v1/workspaces/';
+    if (pathname.startsWith(workspacePrefix)) {
+      await this.#handleWorkspaceRequest(req, res, pathname.slice(workspacePrefix.length));
+      return;
+    }
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
@@ -634,9 +752,6 @@ export class BridgeServer {
       res.end();
       return;
     }
-
-    const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-    const pathname = parsedUrl.pathname;
 
     try {
       if (req.method === 'GET' && pathname === '/api/v1/health') {
@@ -739,9 +854,13 @@ export class BridgeServer {
                 Boolean(detail?.hasPendingBackgroundTasks);
               if (detail && !detail.isSubagent && !detail.pendingInteraction && !isWaitingOnBackgroundWork) {
                 const lastAssistant = [...detail.items].reverse().find((it) => it.role === 'assistant' && it.content);
-                const bodyText = lastAssistant?.content
-                  ? stripInlineAttachmentMarkdown(lastAssistant.content).replace(/[#*`>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 140)
-                  : (isErrorStop ? '会话执行过程中遇到错误' : '本轮任务已完成');
+                const { displayContent, leakedTail } = sanitizeAssistantLeakedTail(lastAssistant?.content ?? '');
+                let bodyText = isErrorStop ? '会话执行过程中遇到错误' : '本轮任务已完成';
+                if (displayContent) {
+                  bodyText = stripInlineAttachmentMarkdown(displayContent).replace(/[#*`>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 140);
+                } else if (leakedTail !== null) {
+                  bodyText = LEAKED_ASSISTANT_PREVIEW_FALLBACK;
+                }
                 const kind = isErrorStop ? 'error' : 'completed';
                 const subParts = [];
                 if (detail.title && detail.title !== 'Antigravity' && detail.title !== 'Levity') subParts.push(detail.title);
@@ -822,6 +941,7 @@ export class BridgeServer {
         const quota = await this.quotaMonitor.getSnapshot();
         this.#sendJson(res, 200, {
           server: this.getPublicStatus(),
+          capabilities: { workspaceBrowser: true },
           workspaces: scan.workspaces,
           archivedConversations: scan.archivedConversations || [],
           knownProjects: scan.knownProjects,
@@ -954,7 +1074,8 @@ export class BridgeServer {
           title: body.title || '',
           model: body.model || '',
           mode: body.mode || 'agent',
-          workspacePath: body.workspacePath || '',
+          workspacePath: body.workspacePath,
+          desktopProjectId: body.desktopProjectId,
           createProjectName: body.createProjectName || '',
           attachments: Array.isArray(body.attachments) ? body.attachments : [],
           metaStore: this.metaStore,
@@ -1232,8 +1353,9 @@ export class BridgeServer {
 
       this.#sendJson(res, 404, { error: 'Not Found' });
     } catch (err) {
-      this.#sendJson(res, 400, {
+      this.#sendJson(res, err instanceof WorkspaceError ? err.status : 400, {
         error: err?.message || 'Internal Server Error',
+        ...(err instanceof WorkspaceError ? { code: err.code } : {}),
       });
     }
   }

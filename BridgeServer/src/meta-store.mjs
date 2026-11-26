@@ -15,6 +15,7 @@ export class MetaStore {
     mkdirSync(this.stateDir, { recursive: true });
     this.authPath = join(this.stateDir, 'auth.json');
     this.metaPath = join(this.stateDir, 'conversations-meta.json');
+    this.workspacesPath = join(this.stateDir, 'workspaces.json');
     this.pushDevicesPath = join(this.stateDir, 'push-devices.json');
     this.lsEndpointPath = join(this.stateDir, 'ls-endpoint.json');
     this.uploadStagingDir = join(this.stateDir, 'uploads-staging');
@@ -26,6 +27,11 @@ export class MetaStore {
 
     this.auth = this.#loadOrInitAuth();
     this.conversations = this.#loadJsonObject(this.metaPath);
+    const workspaces = this.#loadJsonObject(this.workspacesPath);
+    this.workspaces = {
+      favorites: Array.isArray(workspaces.favorites) ? workspaces.favorites : [],
+      recents: Array.isArray(workspaces.recents) ? workspaces.recents : [],
+    };
     this.pushDevices = this.#loadJsonObject(this.pushDevicesPath);
     this.lsEndpoint = this.#loadJsonObject(this.lsEndpointPath);
   }
@@ -250,6 +256,37 @@ export class MetaStore {
       updatedAt: new Date().toISOString(),
     };
     this.#saveMeta();
+  }
+
+  listRememberedWorkspaces() {
+    return Object.values(this.conversations).map((entry) => entry?.workspacePath).filter(Boolean);
+  }
+
+  listWorkspacePaths() {
+    return { favorites: [...this.workspaces.favorites], recents: [...this.workspaces.recents] };
+  }
+
+  #saveWorkspaces(next) {
+    this.#writeAtomic(this.workspacesPath, JSON.stringify(next, null, 2), 0o600);
+    this.workspaces = next;
+  }
+
+  setWorkspaceFavorite(path, isFavorite) {
+    const { favorites } = this.workspaces;
+    if (isFavorite === favorites.includes(path)) return;
+    this.#saveWorkspaces({
+      ...this.workspaces,
+      favorites: isFavorite ? [...favorites, path] : favorites.filter((item) => item !== path),
+    });
+  }
+
+  rememberRecentWorkspace(path) {
+    const { recents } = this.workspaces;
+    if (recents[0] === path) return;
+    this.#saveWorkspaces({
+      ...this.workspaces,
+      recents: [path, ...recents.filter((item) => item !== path)].slice(0, 30),
+    });
   }
 
   registerCreatedConversation(convId, { title, workspacePath, model, mode } = {}) {

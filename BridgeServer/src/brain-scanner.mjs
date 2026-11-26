@@ -12,10 +12,57 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { stripInlineAttachmentMarkdown } from './inline-attachments.mjs';
 import { lookupModelInfo } from './model-catalog.mjs';
+import { DesktopProjects, findWorkspaceDirectory, isLazyHomeDirectory, workspacePathMetadata } from './workspace-paths.mjs';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_CONV_RE = /^[0-9a-zA-Z_-]{6,64}$/;
 const ARTIFACT_EXTS = new Set(['.md', '.png', '.jpg', '.jpeg', '.webp', '.svg', '.txt', '.json']);
+const LEAK_NOTICE = 'The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.';
+const LEAK_METADATA_RE = /^\[Message\]\s+timestamp=\S+\s+sender=[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\/task-\d+\b/;
+export const LEAKED_ASSISTANT_PREVIEW_FALLBACK = '打开查看异常回复';
+
+export function sanitizeAssistantLeakedTail(text) {
+  if (!text.includes('<SYSTEM_MESSAGE>')) return { displayContent: text, leakedTail: null };
+
+  // Keep the separators so the tail can be sliced out of the original string verbatim.
+  const parts = text.split(/(\r?\n)/);
+  let offset = 0;
+  let fence = null;
+  let tailStart = null;
+  for (let i = 0; i < parts.length; i += 2) {
+    const line = parts[i];
+    const lineStart = offset;
+    offset += line.length + (parts[i + 1]?.length ?? 0);
+    if (tailStart !== null) {
+      // Once the unfenced 5-line protocol header has matched, lines inside the leaked
+      // `<SYSTEM_MESSAGE>` payload are raw command logs (which may contain truncated,
+      // unclosed Markdown code fences) and must not mask the closing protocol tag.
+      if (line === '</SYSTEM_MESSAGE>' || line === '</SYSTEM_MESSAGE>model') {
+        return { displayContent: text.slice(0, tailStart).trimEnd(), leakedTail: text.slice(tailStart) };
+      }
+      continue;
+    }
+    if (/^(?: {4}| {0,3}[\t>])/.test(line)) continue;
+
+    const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+    if (marker) {
+      const rest = line.slice(line.indexOf(marker) + marker.length);
+      if (fence) {
+        if (marker[0] === fence[0] && marker.length >= fence.length && !/[^ \t]/.test(rest)) fence = null;
+      } else if (marker[0] === '~' || !rest.includes('`')) {
+        fence = marker;
+      }
+      continue;
+    }
+    if (fence) continue;
+
+    if (line === 'user' && parts[i + 2] === LEAK_NOTICE && parts[i + 4] === '' &&
+        parts[i + 6] === '<SYSTEM_MESSAGE>' && LEAK_METADATA_RE.test(parts[i + 8] ?? '')) {
+      tailStart = lineStart;
+    }
+  }
+  return { displayContent: text, leakedTail: null };
+}
 
 function replyDigest(text) {
   return createHash('sha256').update(text).digest('hex').slice(0, 16);
@@ -438,28 +485,6 @@ function parsePbtxtTitle(txt) {
   return Buffer.from(bytes).toString('utf8').trim();
 }
 
-function extractFirstLocalFolder(obj) {
-  if (!obj) return null;
-  if (typeof obj === 'string') {
-    const p = uriToPath(obj);
-    return p && p.startsWith('/') ? p : null;
-  }
-  if (Array.isArray(obj)) {
-    for (const item of obj) {
-      const found = extractFirstLocalFolder(item);
-      if (found) return found;
-    }
-    return null;
-  }
-  if (typeof obj === 'object') {
-    for (const val of Object.values(obj)) {
-      const found = extractFirstLocalFolder(val);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
 export class BrainScanner {
   constructor({
     appDataDirs = null,
@@ -470,7 +495,7 @@ export class BrainScanner {
   } = {}) {
     this.explicitAppDataDirs = appDataDirs;
     this.projectsRoot = projectsRoot;
-    this.projectsConfigDir = projectsConfigDir || join(homedir(), '.gemini', 'config', 'projects');
+    this.desktopProjects = new DesktopProjects(projectsConfigDir || undefined);
     this.agentController = agentController;
     this.metaStore = metaStore;
     this.transcriptCache = new Map();
@@ -479,50 +504,12 @@ export class BrainScanner {
     this.convStepsDbCache = new Map();
     this.subagentsByParent = new Map();
     this.annotationsCache = new Map();
-    this.desktopProjectsCache = { key: '', map: new Map() };
     this.liveHooks = new Map();
     this.inFlightTools = new Map(); // convId -> { id, name, summary, bypassSandbox, commandLine, askQuestion, startedAt }
   }
 
   readDesktopProjects() {
-    const dir = this.projectsConfigDir;
-    if (!dir || !existsSync(dir)) return new Map();
-    try {
-      const entries = readdirSync(dir, { withFileTypes: true }).filter(
-        (e) => e.isFile() && e.name.endsWith('.json')
-      );
-      const keyParts = [];
-      for (const e of entries) {
-        try {
-          const st = statSync(join(dir, e.name));
-          keyParts.push(`${e.name}:${st.mtimeMs}:${st.size}`);
-        } catch {
-          // Ignore transient file removal
-        }
-      }
-      const cacheKey = keyParts.sort().join('|');
-      if (this.desktopProjectsCache.key === cacheKey) {
-        return this.desktopProjectsCache.map;
-      }
-      const fresh = new Map();
-      for (const e of entries) {
-        try {
-          const parsed = JSON.parse(readFileSync(join(dir, e.name), 'utf-8'));
-          // Skip hidden/auto-managed sidecar projects (e.g. antigravity-z/bridge, swarm/swarm_board)
-          if (!parsed?.id || parsed?.sidecar) continue;
-          const id = String(parsed.id).trim();
-          const name = String(parsed.name || '').trim();
-          const folderPath = extractFirstLocalFolder(parsed.projectResources || parsed.workspaces || parsed.folders);
-          fresh.set(id, { id, name, folderPath });
-        } catch {
-          // Ignore malformed project JSON
-        }
-      }
-      this.desktopProjectsCache = { key: cacheKey, map: fresh };
-      return fresh;
-    } catch {
-      return new Map();
-    }
+    return this.desktopProjects.read();
   }
 
   discoverAppDataDirs() {
@@ -782,25 +769,64 @@ export class BrainScanner {
     return entry;
   }
 
-  listKnownProjectFolders() {
-    const seen = new Map();
-    const roots = [this.projectsRoot];
-    const homeProjects = join(homedir(), 'Projects');
-    if (!roots.includes(homeProjects)) roots.push(homeProjects);
+  *#historicalWorkspacePaths(desktopProjects) {
+    for (const appData of this.discoverAppDataDirs()) {
+      for (const [id, dbEntry] of this.readDesktopSummariesIndex(appData)) {
+        if (dbEntry.killed) continue;
+        yield this.resolveWorkspaceBinding({
+          dbEntry, meta: this.metadataCache.get(id)?.meta, desktopProjects,
+        }).workspacePath;
+      }
+    }
+    for (const { meta } of this.metadataCache.values()) {
+      yield this.resolveWorkspaceBinding({ meta, desktopProjects }).workspacePath;
+    }
+    for (const hook of this.liveHooks.values()) {
+      yield this.resolveWorkspaceBinding({ hook, desktopProjects }).workspacePath;
+    }
+  }
 
-    for (const root of roots) {
+  listKnownProjectFolders({
+    desktopProjects = this.readDesktopProjects(),
+    historicalPaths = this.#historicalWorkspacePaths(desktopProjects),
+  } = {}) {
+    const seen = new Map();
+    const resolved = new Map();
+    const add = (path, source) => {
+      if (!resolved.has(path)) resolved.set(path, findWorkspaceDirectory(path));
+      const directory = resolved.get(path);
+      if (!directory || seen.has(directory.resolvedPath)) return;
+      seen.set(directory.resolvedPath, { ...workspacePathMetadata(directory.path), source });
+    };
+
+    const links = [];
+    for (const root of new Set([this.projectsRoot, join(homedir(), 'Projects')])) {
+      const directory = findWorkspaceDirectory(root);
+      if (!directory || isLazyHomeDirectory(directory.path) || isLazyHomeDirectory(directory.resolvedPath)) continue;
       try {
-        if (!existsSync(root)) continue;
-        for (const d of readdirSync(root, { withFileTypes: true })) {
-          if (d.isDirectory() && !d.name.startsWith('.') && !seen.has(d.name)) {
-            seen.set(d.name, { name: d.name, path: join(root, d.name) });
-          }
+        for (const entry of readdirSync(directory.path, { withFileTypes: true })) {
+          if (entry.name.startsWith('.')) continue;
+          const path = join(directory.path, entry.name);
+          if (entry.isDirectory()) add(path, 'projectsRoot');
+          else if (entry.isSymbolicLink()) links.push(path);
         }
       } catch {
         // Ignore unreadable directories
       }
     }
-    return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+    for (const path of links) add(path, 'projectsRoot');
+    for (const { id, folderPaths } of [...desktopProjects.values()].sort((a, b) => a.id.localeCompare(b.id))) {
+      for (const path of folderPaths) {
+        if (!seen.has(path)) seen.set(path, { ...workspacePathMetadata(path), source: 'desktopProject' });
+        seen.get(path).desktopProjectId ??= id;
+      }
+    }
+    const saved = this.metaStore?.listWorkspacePaths();
+    for (const path of saved?.favorites || []) add(path, 'favorite');
+    for (const path of saved?.recents || []) add(path, 'recent');
+    for (const path of historicalPaths) add(path, 'history');
+    for (const path of this.metaStore?.listRememberedWorkspaces() || []) add(path, 'history');
+    return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
   }
 
   findTranscriptPath(convDir) {
@@ -1096,10 +1122,13 @@ export class BrainScanner {
         } else if (mappedTools.length > 0 && lastAssistantStepIndex >= 0) {
           hasNonBookkeepingStepAfterLastAssistant = true;
         }
-        if (content) {
-          lastPreview = stripInlineAttachmentMarkdown(content).replace(/\s+/g, ' ').slice(0, 140);
+        const { displayContent, leakedTail } = sanitizeAssistantLeakedTail(content);
+        if (displayContent) {
+          lastPreview = stripInlineAttachmentMarkdown(displayContent).replace(/\s+/g, ' ').slice(0, 140);
         } else if (assistantAtts.length > 0) {
           lastPreview = stripInlineAttachmentMarkdown(`[图片] ${assistantAtts.map((a) => a.name).join('、')}`).slice(0, 140);
+        } else if (leakedTail !== null) {
+          lastPreview = LEAKED_ASSISTANT_PREVIEW_FALLBACK;
         }
 
         const isTurnFinal = mappedTools.length === 0 && (Boolean(content) || assistantAtts.length > 0);
@@ -1738,7 +1767,7 @@ export class BrainScanner {
     };
   }
 
-  async scanAll({ includeMetadata = true } = {}) {
+  async scanAll({ includeMetadata = true, includeKnownProjects = true } = {}) {
     const appDataDirs = this.discoverAppDataDirs();
     const rawConvs = [];
 
@@ -2018,7 +2047,10 @@ export class BrainScanner {
     return {
       workspaces,
       archivedConversations,
-      knownProjects: this.listKnownProjectFolders(),
+      knownProjects: includeKnownProjects ? this.listKnownProjectFolders({
+        desktopProjects,
+        historicalPaths: [...byId.values()].map((conv) => conv.workspacePath),
+      }) : [],
       totalConversations: rootConversations.length - archivedConversations.length,
       unreadCount,
     };

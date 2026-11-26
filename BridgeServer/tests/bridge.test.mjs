@@ -1,19 +1,373 @@
 import assert from 'node:assert/strict';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import fs, { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import os, { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { AgentController } from '../src/agent-controller.mjs';
 import { ApnsPusher } from '../src/apns-pusher.mjs';
 import { BrainScanner } from '../src/brain-scanner.mjs';
+import { sanitizeAssistantLeakedTail } from '../src/brain-scanner.mjs';
 import { BridgeServer } from '../src/bridge-server.mjs';
 import { BridgeUpdater, compareSemver } from '../src/bridge-updater.mjs';
 import { MetaStore } from '../src/meta-store.mjs';
 import { generateQrSvg } from '../src/qr-svg.mjs';
 import { QuotaMonitor } from '../src/quota-monitor.mjs';
+import { resolveWorkspaceDirectory, workspaceLocations } from '../src/workspace-paths.mjs';
+
+function workspaceFixture(t) {
+  const sandbox = mkdtempSync(join(tmpdir(), 'levity-workspaces-'));
+  t.after(() => rmSync(sandbox, { recursive: true, force: true }));
+  const projectsRoot = join(sandbox, 'Projects');
+  const projectsConfigDir = join(sandbox, 'registrations');
+  const appData = join(sandbox, 'app-data');
+  const stateDir = join(sandbox, 'state');
+  for (const dir of [projectsRoot, projectsConfigDir, join(appData, 'brain')]) mkdirSync(dir, { recursive: true });
+  const metaStore = new MetaStore({ stateDir });
+  const scanner = new BrainScanner({ projectsRoot, projectsConfigDir, appDataDirs: [appData], metaStore });
+  const captured = [];
+  const controller = new AgentController({
+    projectsRoot, projectsConfigDir, agentApiPath: 'mock-agentapi',
+    brainDirsProvider: () => [appData],
+    execFn: async (_bin, args, options) => {
+      captured.push({ args, ...options });
+      return { stdout: JSON.stringify({ conversationId: 'workspace-session' }) };
+    },
+  });
+  const register = (id, binding) => {
+    writeFileSync(join(projectsConfigDir, `${id}.json`), JSON.stringify({ id, name: id.toUpperCase(), ...binding }));
+  };
+  return { sandbox, projectsRoot, scanner, controller, metaStore, stateDir, captured, register };
+}
+
+test('BrainScanner merges both project roots, directory links, registered folders and trusted workspace history', t => {
+  const { sandbox, projectsRoot, scanner, metaStore, register } = workspaceFixture(t);
+  const home = join(sandbox, 'home');
+  const homeProject = join(home, 'Projects', 'foo');
+  const project = join(projectsRoot, 'foo');
+  const linkedTarget = join(sandbox, 'linked-target');
+  const link = join(projectsRoot, 'linked');
+  const desktop = join(sandbox, 'Desktop Repo');
+  const history = join(sandbox, 'historical');
+  const saved = join(sandbox, 'remembered');
+  const favorite = join(sandbox, 'favorite');
+  const recent = join(sandbox, 'recent');
+  const ignored = join(sandbox, 'hidden-sidecar');
+  for (const path of [homeProject, project, linkedTarget, desktop, history, saved, favorite, recent, ignored]) {
+    mkdirSync(path, { recursive: true });
+  }
+  symlinkSync(linkedTarget, link);
+  symlinkSync(project, join(projectsRoot, 'alias-of-foo'));
+  symlinkSync(join(sandbox, 'missing'), join(projectsRoot, 'broken'));
+  writeFileSync(join(sandbox, 'file'), '');
+  symlinkSync(join(sandbox, 'file'), join(projectsRoot, 'file-link'));
+  register('desktop', { projectResources: { localFolders: [{ uri: pathToFileURL(desktop).href }] } });
+  register('sidecar', { folders: [ignored], sidecar: { sidecarId: 'test' } });
+  scanner.readDesktopSummariesIndex = () => new Map([
+    ['history-session', { workspaceUri: pathToFileURL(history).href }],
+    ['pseudo-session', { workspaceUri: 'project://fake' }],
+    ['dead-session', { workspaceUri: pathToFileURL(ignored).href, killed: true }],
+  ]);
+  metaStore.rememberWorkspace('saved-session', saved);
+  metaStore.rememberWorkspace('missing-session', join(sandbox, 'not-a-directory-yet'));
+  metaStore.setWorkspaceFavorite(favorite, true);
+  metaStore.rememberRecentWorkspace(recent);
+
+  const mockHome = t.mock.method(os, 'homedir', () => home);
+  syncBuiltinESMExports();
+  try {
+    const known = scanner.listKnownProjectFolders();
+    const byPath = new Map(known.map((item) => [realpathSync.native(item.path), item]));
+    assert.equal(known.length, byPath.size, 'aliases of the same directory only appear once');
+    assert.equal(byPath.get(realpathSync.native(project)).name, 'foo');
+    assert.equal(byPath.get(realpathSync.native(project)).parentPath, projectsRoot);
+    assert.deepEqual(byPath.get(realpathSync.native(homeProject)), {
+      name: 'foo', path: homeProject, parentPath: join(home, 'Projects'), source: 'projectsRoot',
+    });
+    assert.equal(byPath.get(realpathSync.native(linkedTarget)).path, link);
+    assert.equal(byPath.get(realpathSync.native(desktop)).desktopProjectId, 'desktop');
+    for (const [path, source] of [[history, 'history'], [saved, 'history'], [favorite, 'favorite'], [recent, 'recent']]) {
+      assert.equal(byPath.get(realpathSync.native(path)).source, source);
+    }
+    assert.equal(known.length, 8);
+    assert.ok(!known.some(({ name }) => ['broken', 'file-link', 'not-a-directory-yet', 'fake'].includes(name)));
+  } finally {
+    mockHome.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('AgentController matches exact normalized desktop folders and validates cwd before creating a conversation', async t => {
+  const { sandbox, projectsRoot, controller, metaStore, stateDir, captured, register } = workspaceFixture(t);
+  const repo = join(projectsRoot, 'Repo');
+  const repoOld = join(projectsRoot, 'Repo-old');
+  const spaces = join(projectsRoot, 'Repo With Spaces');
+  const alias = join(sandbox, 'Alias');
+  const file = join(sandbox, 'file');
+  for (const dir of [repo, repoOld, spaces]) mkdirSync(dir);
+  symlinkSync(spaces, alias);
+  writeFileSync(file, '');
+  register('prefix', { projectResources: { localFolders: [{ uri: pathToFileURL(repoOld).href }] } });
+  register('z-choice', { workspaces: [{ workspaceFolderAbsoluteUri: pathToFileURL(spaces).href }] });
+  register('a-choice', { projectResources: {}, folders: [{ uri: pathToFileURL(alias).href }] });
+  register('sidecar', { folders: [repo], sidecar: true });
+
+  assert.equal(controller.resolveDesktopProjectIdForWorkspace(repo), 'outside-of-project');
+  assert.equal(controller.resolveDesktopProjectIdForWorkspace(repoOld), 'prefix');
+  assert.equal(controller.resolveDesktopProjectIdForWorkspace(spaces), 'a-choice');
+  assert.equal(controller.resolveDesktopProjectIdForWorkspace(alias, 'z-choice'), 'z-choice');
+  assert.equal(controller.resolveDesktopProjectIdForWorkspace(spaces, 'prefix'), 'a-choice');
+  for (const [path, code, status] of [
+    [join(sandbox, 'missing'), 'NOT_FOUND', 404],
+    [file, 'NOT_A_DIRECTORY', 400],
+    [join(file, 'child'), 'NOT_A_DIRECTORY', 400],
+    ['project://not-local', 'INVALID_PATH', 400],
+    [`/Volumes/${sandbox.split('/').at(-1)}/Repo`, 'VOLUME_OFFLINE', 400],
+  ]) {
+    await assert.rejects(controller.createConversation({ prompt: 'Test', workspacePath: path, metaStore }), { code, status });
+  }
+  assert.equal(captured.length, 0);
+  assert.deepEqual(metaStore.listWorkspacePaths().recents, []);
+
+  const result = await controller.createConversation({
+    prompt: 'Test', workspacePath: alias, desktopProjectId: 'z-choice', metaStore,
+  });
+  const canonical = realpathSync.native(spaces);
+  assert.equal(result.workspacePath, canonical);
+  assert.equal(captured[0].cwd, canonical);
+  assert.equal(captured[0].env.ANTIGRAVITY_PROJECT_ID, 'z-choice');
+  await controller.createConversation({ prompt: 'Test again', workspacePath: spaces, metaStore });
+  assert.deepEqual(new MetaStore({ stateDir }).listWorkspacePaths().recents, [canonical]);
+});
+
+test('Workspace APIs browse arbitrary folders, persist favorites and advertise the capability without URL authentication', async t => {
+  const { sandbox, projectsRoot, scanner, controller, metaStore, stateDir, register } = workspaceFixture(t);
+  const parent = join(sandbox, 'outside-root');
+  const child = join(parent, 'Alpha');
+  const symlink = join(parent, 'Shortcut');
+  const home = join(sandbox, 'home');
+  const documents = join(home, 'Documents');
+  const recent = join(sandbox, 'used');
+  const inaccessible = join(parent, 'Denied');
+  for (const path of [child, join(parent, 'Beta'), join(parent, '.Hidden'), documents, recent, inaccessible]) {
+    mkdirSync(path, { recursive: true });
+  }
+  symlinkSync(child, symlink);
+  symlinkSync(join(parent, 'nowhere'), join(parent, 'Broken'));
+  writeFileSync(join(parent, 'file'), '');
+  symlinkSync(join(parent, 'file'), join(parent, 'FileLink'));
+  register('desk', { folders: [pathToFileURL(child).href] });
+  register('alt', { workspaces: [{ uri: pathToFileURL(symlink).href }] });
+  register('sidecar', { folders: [parent], sidecar: true });
+
+  const homeMock = t.mock.method(os, 'homedir', () => home);
+  syncBuiltinESMExports();
+  t.after(() => {
+    homeMock.mock.restore();
+    syncBuiltinESMExports();
+  });
+  const bridge = new BridgeServer({
+    port: 0, host: '127.0.0.1', metaStore, brainScanner: scanner, agentController: controller,
+    quotaMonitor: { getSnapshot: async () => null },
+  });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  const base = `http://127.0.0.1:${bridge.getBoundPort()}/api/v1`;
+  const token = metaStore.getToken();
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+  const request = async (endpoint, body, expectedStatus = 200) => {
+    const response = await fetch(`${base}/${endpoint}`, {
+      headers,
+      ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
+    });
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    const data = await response.json();
+    assert.equal(response.status, expectedStatus, JSON.stringify(data));
+    return data;
+  };
+  const suggestions = () => request('workspaces/suggestions');
+  const list = (body, status) => request('workspaces/list', body, status);
+  const resolve = (path, status) => request('workspaces/resolve', { path }, status);
+  const favorite = (action, path) => request('workspaces/favorites', { action, path });
+  for (const [route, method] of [['suggestions', 'GET'], ['list', 'POST'], ['resolve', 'POST'], ['favorites', 'POST']]) {
+    const rejected = await fetch(`${base}/workspaces/${route}?token=${encodeURIComponent(token)}`, { method });
+    assert.equal(rejected.status, 401);
+    assert.equal(rejected.headers.get('cache-control'), 'no-store');
+    assert.equal((await rejected.json()).code, 'UNAUTHORIZED');
+  }
+  const health = await request('health');
+  assert.deepEqual(health.capabilities, ['inline_images', 'bridge_update_check', 'self_update', 'workspace_browser']);
+  const boot = await request('bootstrap');
+  assert.equal(boot.capabilities.workspaceBrowser, true);
+  assert.deepEqual(boot.server.capabilities, ['inline_images', 'bridge_update_check', 'self_update', 'workspace_browser']);
+  assert.ok(boot.knownProjects.some(({ desktopProjectId }) => desktopProjectId === 'alt'));
+
+  const saved = await favorite('add', symlink);
+  const canonical = realpathSync.native(child);
+  assert.deepEqual(saved.favorites, [{
+    name: 'Alpha', path: canonical, parentPath: realpathSync.native(parent), available: true,
+    desktopProjectId: 'alt', desktopProjectName: 'ALT',
+  }]);
+  assert.deepEqual(await favorite('add', child), saved);
+  assert.deepEqual(new MetaStore({ stateDir }).listWorkspacePaths().favorites, [canonical]);
+  const initial = await suggestions();
+  assert.deepEqual(initial.favorites, saved.favorites);
+  assert.deepEqual(initial.recents, []);
+  assert.deepEqual(initial.desktopProjects.map(({ id }) => id).sort(), ['alt', 'desk']);
+  assert.equal(initial.locations[0].path, projectsRoot);
+  assert.ok(initial.locations.some(({ path, name }) => path === documents && name === 'Documents'));
+  assert.equal(initial.locations.at(-1).path, '/');
+  assert.ok(!initial.locations.some(({ kind, path }) => kind === 'volume' && realpathSync.native(path) === '/'));
+
+  const listing = await list({ path: parent });
+  assert.equal(listing.resolvedPath, realpathSync.native(parent));
+  assert.equal(listing.parentPath, sandbox);
+  assert.equal(listing.isRoot, false);
+  assert.deepEqual(listing.entries.map(({ name }) => name), ['Alpha', 'Beta', 'Denied', 'Shortcut']);
+  assert.deepEqual(listing.entries.at(-1), {
+    name: 'Shortcut', path: symlink, isSymlink: true, isHidden: false, isFavorite: true,
+  });
+  assert.equal(listing.truncated, false);
+  assert.equal(listing.totalReturned, 4);
+  assert.deepEqual((await list({ path: parent, filter: 'aLp' })).entries.map(({ name }) => name), ['Alpha']);
+  const hidden = await list({ path: parent, showHidden: true, filter: 'hidden' });
+  assert.equal(hidden.entries[0].isHidden, true);
+  const limited = await list({ path: parent, limit: 1 });
+  assert.equal(limited.totalReturned, 1);
+  assert.equal(limited.truncated, true);
+  assert.equal((await list({ path: '' })).path, projectsRoot);
+  assert.equal((await list({ path: '/' })).isRoot, true);
+  assert.equal((await list({ path: '/' })).parentPath, null);
+
+  const resolved = await resolve(symlink);
+  assert.equal(resolved.path, symlink);
+  assert.equal(resolved.resolvedPath, canonical);
+  assert.equal(resolved.isFavorite, true);
+  assert.deepEqual(resolved.matchingDesktopProjects, [{ id: 'alt', name: 'ALT' }, { id: 'desk', name: 'DESK' }]);
+  assert.equal((await resolve('~/Documents')).resolvedPath, realpathSync.native(documents));
+  assert.equal((await resolve(join(parent, 'file'), 400)).code, 'NOT_A_DIRECTORY');
+  assert.equal((await resolve(join(parent, 'Broken'), 404)).code, 'NOT_FOUND');
+  assert.equal((await resolve('project://bad', 400)).code, 'INVALID_PATH');
+  // Root can read mode-000 folders, so inject the kernel denial for that runner.
+  const stat = fs.statSync;
+  const accessMock = process.getuid?.() === 0 && t.mock.method(fs, 'statSync', (path, ...options) => {
+    if (path === inaccessible) throw Object.assign(new Error('Access denied'), { code: 'EACCES' });
+    return stat(path, ...options);
+  });
+  if (accessMock) syncBuiltinESMExports();
+  chmodSync(inaccessible, 0o000);
+  try {
+    assert.deepEqual(await list({ path: inaccessible }, 403), {
+      error: 'Mac 拒绝访问此目录', code: 'PERMISSION_DENIED',
+    });
+  } finally {
+    chmodSync(inaccessible, 0o700);
+    if (accessMock) {
+      accessMock.mock.restore();
+      syncBuiltinESMExports();
+    }
+  }
+  assert.equal((await request('conversations', { prompt: 'Hi', workspacePath: join(parent, 'missing') }, 404)).code, 'NOT_FOUND');
+  await request('conversations', { prompt: 'Hi', workspacePath: recent }, 201);
+  assert.equal((await suggestions()).recents[0].path, realpathSync.native(recent));
+  rmSync(recent, { recursive: true });
+  assert.deepEqual((await suggestions()).recents, []);
+  rmSync(child, { recursive: true });
+  assert.equal((await suggestions()).favorites[0].available, false);
+  assert.deepEqual(await favorite('remove', canonical), { favorites: [] });
+  assert.deepEqual(new MetaStore({ stateDir }).listWorkspacePaths().favorites, []);
+});
+
+test('Workspace list caps returned directories at 200 and stops scanning after 4000 entries', async t => {
+  const { sandbox, projectsRoot, scanner, controller, metaStore } = workspaceFixture(t);
+  const wide = join(sandbox, 'wide');
+  mkdirSync(wide);
+  for (let index = 0; index < 201; index++) mkdirSync(join(projectsRoot, `dir-${index}`));
+  for (let index = 0; index < 4001; index++) writeFileSync(join(wide, `skip-${index}`), '');
+  const bridge = new BridgeServer({
+    port: 0, host: '127.0.0.1', metaStore, brainScanner: scanner, agentController: controller,
+    quotaMonitor: { getSnapshot: async () => null },
+  });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  const list = async (body) => {
+    const response = await fetch(`http://127.0.0.1:${bridge.getBoundPort()}/api/v1/workspaces/list`, {
+      method: 'POST', headers: { Authorization: `Bearer ${metaStore.getToken()}` }, body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const clamped = await list({ limit: 999 });
+  assert.equal(clamped.totalReturned, 200);
+  assert.equal(clamped.truncated, true);
+  const bounded = await list({ path: wide, filter: 'absent' });
+  assert.deepEqual(bounded.entries, []);
+  assert.equal(bounded.truncated, true);
+});
+
+test('Workspace volume discovery excludes stale mount directories and the root symlink', t => {
+  const states = new Map([
+    ['/Volumes', { dev: 1, isDirectory: () => true }],
+    ['/Volumes/Mounted', { dev: 2, isDirectory: () => true }],
+    ['/Volumes/Mounted/Repo', { dev: 2, isDirectory: () => true }],
+    ['/Volumes/Stale', { dev: 1, isDirectory: () => true }],
+    ['/Volumes/System', { dev: 3, isDirectory: () => true }],
+  ]);
+  const originalStat = fs.statSync;
+  const originalReadDir = fs.readdirSync;
+  const originalRealpath = fs.realpathSync.native;
+  const statMock = t.mock.method(fs, 'statSync', (path, ...options) =>
+    states.get(path) || originalStat(path, ...options));
+  const directoryMock = t.mock.method(fs, 'readdirSync', (path, ...options) =>
+    path === '/Volumes' ? ['Stale', 'Mounted', 'System'] : originalReadDir(path, ...options));
+  const realpathMock = t.mock.method(fs.realpathSync, 'native', (path, ...options) => {
+    if (path === '/Volumes/System') return '/';
+    return states.has(path) ? path : originalRealpath(path, ...options);
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.deepEqual(workspaceLocations('/Volumes/Mounted/Repo').filter(({ kind }) => kind === 'volume'), [{
+      kind: 'volume', name: 'Mounted', path: '/Volumes/Mounted', parentPath: '/Volumes',
+    }]);
+    assert.equal(resolveWorkspaceDirectory('/Volumes/Mounted/Repo').resolvedPath, '/Volumes/Mounted/Repo');
+    assert.equal(resolveWorkspaceDirectory('/Volumes/System').resolvedPath, '/');
+    assert.throws(() => resolveWorkspaceDirectory('/Volumes/Stale'), { code: 'VOLUME_OFFLINE', status: 400 });
+  } finally {
+    for (const mock of [statMock, directoryMock, realpathMock]) mock.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('Background project discovery never enumerates lazy home locations even when configured through an alias', t => {
+  const { sandbox, scanner } = workspaceFixture(t);
+  const home = join(sandbox, 'home');
+  const documents = join(home, 'Documents');
+  const alias = join(sandbox, 'root-alias');
+  mkdirSync(join(documents, 'Unopened'), { recursive: true });
+  symlinkSync(documents, alias);
+  scanner.projectsRoot = alias;
+
+  const originalReadDir = fs.readdirSync;
+  const reads = [];
+  const homeMock = t.mock.method(os, 'homedir', () => home);
+  const directoryMock = t.mock.method(fs, 'readdirSync', (path, ...options) => {
+    if ([documents, alias].includes(path)) reads.push(path);
+    return originalReadDir(path, ...options);
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.deepEqual(scanner.listKnownProjectFolders(), []);
+    assert.ok(workspaceLocations(alias).some(({ path }) => path === documents));
+    assert.deepEqual(reads, []);
+  } finally {
+    for (const mock of [homeMock, directoryMock]) mock.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
 
 test('QuotaMonitor parses GetUserStatus model quota pools and reset times', () => {
   const parsed = QuotaMonitor.parseUserStatus({
@@ -71,6 +425,67 @@ test('QuotaMonitor parses GetUserStatus model quota pools and reset times', () =
   assert.equal(combined.pools[1].weeklyPercent, 100);
   assert.equal(combined.byModelId['gemini-4-carbon-high'].weeklyPercent, 61);
   assert.equal(combined.byModelId['gpt-oss-120b-medium'].weeklyPercent, 100);
+
+  // Authoritative RetrieveUserQuotaSummary pool values must override stale legacy GetUserStatus values (e.g. 89% vs 100%)
+  // AND never mix a summary percentage with a stale legacy reset timestamp when pool.resetTime is null.
+  const authoritative = QuotaMonitor.parseCombined(
+    {
+      response: {
+        groups: [
+          {
+            displayName: 'Gemini Models',
+            buckets: [
+              { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.98, resetTime: '2026-12-03T06:00:00Z' },
+              { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.93, resetTime: '2026-11-26T12:04:00Z' },
+            ],
+          },
+          {
+            displayName: 'Claude and GPT models',
+            buckets: [
+              { bucketId: '3p-weekly', window: 'weekly', remainingFraction: 0.94, resetTime: '2026-12-03T07:00:00Z' },
+              { bucketId: '3p-5h', window: '5h', remainingFraction: 0.89, resetTime: null },
+            ],
+          },
+        ],
+      },
+    },
+    {
+      userTier: { name: 'Google AI Ultra' },
+      cascadeModelConfigData: {
+        clientModelConfigs: [
+          {
+            label: 'Claude Opus 5.5 (High)',
+            quotaInfo: { remainingFraction: 1.0, resetTime: '2026-11-26T11:11:11Z' },
+          },
+        ],
+      },
+    }
+  );
+  assert.equal(authoritative.pools[1].remainingPercent, 89);
+  assert.equal(authoritative.byModelId['claude-opus-5-5-high'].remainingPercent, 89);
+  assert.equal(authoritative.byModelId['claude-opus-5-5-high'].remainingFraction, 0.89);
+  assert.equal(authoritative.byModelId['claude-opus-5-5-high'].resetTime, null);
+  assert.equal(authoritative.byModelId['claude-opus-5-5-high'].weeklyPercent, 94);
+
+  // Null 5h remainingFraction must be treated as missing (falling back to weekly), NEVER coerced to 0%!
+  const nullFiveH = QuotaMonitor.parseCombined(
+    {
+      response: {
+        groups: [
+          {
+            displayName: 'Claude and GPT models',
+            buckets: [
+              { bucketId: '3p-5h', window: '5h', remainingFraction: null },
+              { bucketId: '3p-weekly', window: 'weekly', remainingFraction: 0.94, resetTime: '2026-12-03T07:00:00Z' },
+            ],
+          },
+        ],
+      },
+    },
+    { userTier: { name: 'Google AI Ultra' } }
+  );
+  assert.equal(nullFiveH.pools[0].remainingPercent, 94);
+  assert.equal(nullFiveH.pools[0].weeklyPercent, 94);
 });
 
 test('QR SVG generator produces valid crisp SVG for pairing URIs', () => {
@@ -1924,7 +2339,7 @@ test('Stop hook beats stale SQLite not_fully_idle and emits atomic workspaces_up
       ].join('\n') + '\n'
     );
 
-    const metaStore = new MetaStore(join(sandbox, 'meta'));
+    const metaStore = new MetaStore({ stateDir: join(sandbox, 'meta') });
     const scanner = new BrainScanner({ appDataDirs: [appDataDir], metaStore });
     const fakeApns = {
       isConfigured: () => true,
@@ -2057,7 +2472,7 @@ test('Desktop stream-interrupted cancel clears thinking state immediately withou
       ].join('\n') + '\n'
     );
 
-    const metaStore = new MetaStore(join(sandbox, 'meta'));
+    const metaStore = new MetaStore({ stateDir: join(sandbox, 'meta') });
     const scanner = new BrainScanner({ appDataDirs: [appDataDir], metaStore });
     scanner.recordHookEvent({ conversationId: convId, hookEventName: 'PreInvocation' });
 
@@ -2650,7 +3065,7 @@ test('Bridge update HTTP routes authenticate, advertise the handshake, and sched
   const boot = await fetch(`${base}/api/v1/bootstrap`, { headers }).then(res => res.json());
   assert.equal(boot.server.version, '1.1.0');
   assert.equal(boot.server.protocolVersion, 2);
-  assert.deepEqual(boot.server.capabilities, ['inline_images', 'bridge_update_check', 'self_update']);
+  assert.deepEqual(boot.server.capabilities, ['inline_images', 'bridge_update_check', 'self_update', 'workspace_browser']);
   assert.equal(boot.server.updateInfo.canSelfUpdate, true);
   assert.equal(bridge.getPairingInfo().version, '1.1.0');
   const postUpdate = () => fetch(`${base}/api/v1/bridge/update`, { method: 'POST', headers });
@@ -2780,4 +3195,146 @@ test('BridgeServer negotiates inline_images capability so legacy 1.0(19) clients
   const modernItem = modernRes.detail.items.find((it) => it.role === 'assistant');
   assert.ok(modernItem.content.includes('![Shot](levity-attachment://shot.png)'));
   assert.equal(modernItem.legacyContent, undefined);
+});
+
+// These signature examples are mirrored in AntigravityZTests/AntigravityZTests.swift.
+const leakedTailLines = [
+  'user',
+  'The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.',
+  '',
+  '<SYSTEM_MESSAGE>',
+  '[Message] timestamp=2026-11-25T02:18:04Z sender=8a57e5fd-3cea-4f8a-a57e-01f70bd8bf8d/task-42',
+  '后台任务已结束。',
+  '</SYSTEM_MESSAGE>',
+];
+const leakedTail = leakedTailLines.join('\n');
+const leakedModelContinuation = [
+  ...leakedTailLines.slice(0, -1), '</SYSTEM_MESSAGE>model', '所有测试都通过，可以交付了。',
+].join('\n');
+
+test('sanitizeAssistantLeakedTail preserves LF and CRLF and captures the entire model continuation', () => {
+  for (const newline of ['\n', '\r\n']) {
+    const tail = leakedTailLines.join(newline) + newline;
+    const prefix = `  已核对消息预览。${newline}继续检查通知。`;
+    assert.deepEqual(sanitizeAssistantLeakedTail(`${prefix} \t${newline}${newline}${tail}`), {
+      displayContent: prefix, leakedTail: tail,
+    });
+  }
+  assert.deepEqual(sanitizeAssistantLeakedTail(`正在等测试结果。\n\n${leakedModelContinuation}`), {
+    displayContent: '正在等测试结果。', leakedTail: leakedModelContinuation,
+  });
+  assert.deepEqual(sanitizeAssistantLeakedTail(leakedTail), { displayContent: '', leakedTail });
+});
+
+test('sanitizeAssistantLeakedTail preserves fenced code, quoted prose, and incomplete signatures', () => {
+  const nonMatches = [
+    '```text\n' + leakedTail + '\n```',
+    `  ~~~text\n${leakedTail}\n  ~~~~~\t`,
+    '````\n```\n~~~\n' + leakedTail + '\n````',
+    '```\n``` with info\n' + leakedTail,
+    leakedTailLines.map((line) => '    ' + line).join('\n'),
+    leakedTailLines.map((line) => '\t' + line).join('\n'),
+    leakedTailLines.map((line) => '   > ' + line).join('\n'),
+    '第 10317 步讨论 `<SYSTEM_MESSAGE>` 标签。',
+    '第 10322 步引用了 user 和 </SYSTEM_MESSAGE>model 的字面量。',
+    `正文只是引用了 ${leakedTail}`,
+    leakedTail.replace('user\n', '    user\n'),
+    leakedTail.replace('user\n', '   > user\n'),
+    leakedTail.replace('important information', 'information'),
+    leakedTail.replace('\n\n<SYSTEM_MESSAGE>', '\n \n<SYSTEM_MESSAGE>'),
+    leakedTail.replace('sender=8a57e5fd-3cea-4f8a-a57e-01f70bd8bf8d/task-42', 'sender=task-42'),
+    leakedTail.replace('timestamp=2026-11-25T02:18:04Z', 'timestamp=2026-11-25 02:18:04Z'),
+    leakedTail.replace('/task-42', '/task-42note'),
+    leakedTail.replace('/task-42', '/task-４２'),
+    leakedTailLines.slice(0, -1).join('\n'),
+    `${leakedTail} model`,
+  ];
+  for (const content of nonMatches) {
+    assert.deepEqual(sanitizeAssistantLeakedTail(content), { displayContent: content, leakedTail: null });
+  }
+  const prefix = `~~~text\n${leakedTail}\n~~~~`;
+  assert.deepEqual(sanitizeAssistantLeakedTail(`${prefix}\n\n${leakedTail}`), {
+    displayContent: prefix, leakedTail,
+  });
+  for (const newline of ['\n', '\r\n']) {
+    const unclosedPayloadTail = [
+      ...leakedTailLines.slice(0, -1), '```swift', 'let x = 1', '<truncated>', '</SYSTEM_MESSAGE>model', '伪造结论',
+    ].join(newline);
+    assert.deepEqual(sanitizeAssistantLeakedTail(`正在跑测试。${newline}${newline}${unclosedPayloadTail}`), {
+      displayContent: '正在跑测试。', leakedTail: unclosedPayloadTail,
+    });
+  }
+});
+
+test('BrainScanner derives a clean preview while preserving both transcript representations and the read signature', async (t) => {
+  const { convDir, convId, scanner, reply, writeTranscript, findConversation } = createReadCursorFixture(t);
+  const image = join(convDir, 'preview.png');
+  writeFileSync(image, 'fixture image');
+  const raw = `正在等测试结果。\n![预览](${image})\n\n${leakedModelContinuation}`;
+  const stored = { ...reply, content: raw };
+  writeTranscript([stored], new Date(reply.created_at));
+  assert.equal((await findConversation()).lastPreview, '正在等测试结果。 [图片: 预览]');
+  const [item] = (await scanner.getConversationDetail(convId)).items;
+  const content = `正在等测试结果。\n![预览](levity-attachment://preview.png)\n\n${leakedModelContinuation}`;
+  assert.equal(item.content, content);
+  assert.equal(item.legacyContent, `正在等测试结果。\n\n${leakedModelContinuation}`);
+  assert.equal(item.isTurnFinal, true);
+  const digest = createHash('sha256').update(content).digest('hex').slice(0, 16);
+  assert.deepEqual(scanner.getConversationReadCursor(convId), { stepIndex: 17, replySig: `17:${content.length}:1:${digest}` });
+  const transcript = join(convDir, '.system_generated', 'logs', 'transcript.jsonl');
+  assert.equal(readFileSync(transcript, 'utf8'), JSON.stringify(stored) + '\n');
+});
+
+test('BrainScanner uses a neutral pure-leak preview and prefers the existing image preview for attachments', async (t) => {
+  const { convDir, convId, scanner, reply, writeTranscript, findConversation } = createReadCursorFixture(t);
+  writeTranscript([{ ...reply, content: leakedTail }], new Date(reply.created_at));
+  assert.equal((await findConversation()).lastPreview, '打开查看异常回复');
+  const [item] = (await scanner.getConversationDetail(convId)).items;
+  assert.equal(item.content, leakedTail);
+  assert.equal(item.isTurnFinal, true);
+
+  const image = join(convDir, 'preview.png');
+  writeFileSync(image, 'fixture image');
+  writeTranscript([{ ...reply, content: leakedTail, media: [{ uri: image }] }], new Date(Date.now() + 1_000));
+  assert.equal((await findConversation()).lastPreview, '[图片] preview.png');
+
+  const nonLeaks = ['第 10317 步讨论 `<SYSTEM_MESSAGE>` 标签。', '```text\n' + leakedTail + '\n```'];
+  for (const [index, content] of nonLeaks.entries()) {
+    writeTranscript([{ ...reply, content }], new Date(Date.now() + 2_000 + index * 1_000));
+    assert.equal((await findConversation()).lastPreview, content.replace(/\s+/g, ' ').slice(0, 140));
+  }
+});
+
+test('Stop hook uses the sanitized summary for APNs and toast while retaining the received reply', { timeout: 5000 }, async (t) => {
+  const { convId, scanner, metaStore, reply, writeTranscript } = createReadCursorFixture(t);
+  const bridge = new BridgeServer({
+    port: 0, host: '127.0.0.1', metaStore, brainScanner: scanner,
+    agentController: { isAvailable: () => false },
+  });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  const endpoint = `http://127.0.0.1:${bridge.getBoundPort()}/internal/hook`;
+  const cases = [
+    { content: `正在等测试结果。\n\n${leakedModelContinuation}`, summary: '正在等测试结果。' },
+    { content: leakedTail, summary: '打开查看异常回复' },
+  ];
+  for (const [index, { content, summary }] of cases.entries()) {
+    writeTranscript([{ ...reply, content, step_index: 17 + index }], new Date(Date.now() + index * 1000));
+    const alert = new Promise((resolve) => {
+      bridge.apnsPusher.notifyConversation = async (args) => {
+        resolve(args);
+        return { ok: true, sent: 1 };
+      };
+    });
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-antigravityz-hook-secret': metaStore.getHookSecret() },
+      body: JSON.stringify({ hookEventName: 'Stop', conversationId: convId, continuationActive: false }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await alert).body, summary);
+    assert.equal(bridge.ringBuffer.filter((event) => event.type === 'notification_event').at(-1)?.notificationBody, summary);
+    const [item] = (await scanner.getConversationDetail(convId)).items;
+    assert.equal(item.content, content);
+  }
 });

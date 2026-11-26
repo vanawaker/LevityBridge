@@ -4,11 +4,15 @@
  * and new conversation / workspace initialization.
  */
 import { execFile } from 'node:child_process';
-import { accessSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { accessSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import { promisify } from 'node:util';
 import { lookupModelInfo } from './model-catalog.mjs';
+import {
+  checkWorkspaceVolume, DesktopProjects, findWorkspaceDirectory, matchingDesktopProjects,
+  openWorkspaceDirectory, resolveWorkspaceDirectory,
+} from './workspace-paths.mjs';
 
 const execFileAsync = promisify(execFile);
 const PROJECT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -25,12 +29,14 @@ export class AgentController {
     agentApiPath = null,
     projectsRoot = process.env.ANTIGRAVITYZ_PROJECTS_ROOT || join(homedir(), 'Projects'),
     expectedMount = process.env.ANTIGRAVITYZ_REQUIRED_MOUNT || '',
+    projectsConfigDir,
     brainDirsProvider = null,
     execFn = null,
   } = {}) {
     this.agentApiPath = agentApiPath || join(homedir(), '.gemini', 'antigravity', 'bin', 'agentapi');
     this.projectsRoot = projectsRoot;
     this.expectedMount = expectedMount;
+    this.desktopProjects = new DesktopProjects(projectsConfigDir);
     this.brainDirsProvider = brainDirsProvider;
     this.execFn = execFn || ((bin, args, opts) => execFileAsync(bin, args, opts));
   }
@@ -64,6 +70,7 @@ export class AgentController {
     if (!PROJECT_NAME_RE.test(cleanName)) {
       throw new Error('项目名称仅支持字母、数字、点、下划线和连字符');
     }
+    checkWorkspaceVolume(resolvePath(this.projectsRoot));
     if (this.expectedMount && !existsSync(this.expectedMount)) {
       throw new Error(`目标存储卷 ${this.expectedMount} 未挂载，已中止创建`);
     }
@@ -298,29 +305,11 @@ export class AgentController {
     return set;
   }
 
-  resolveDesktopProjectIdForWorkspace(workspacePath) {
-    const cleanTarget = workspacePath ? resolvePath(String(workspacePath)) : '';
-    if (!cleanTarget) return 'outside-of-project';
-    try {
-      const projectsDir = join(homedir(), '.gemini', 'config', 'projects');
-      if (!existsSync(projectsDir)) return 'outside-of-project';
-      for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
-        if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-        try {
-          const parsed = JSON.parse(readFileSync(join(projectsDir, entry.name), 'utf-8'));
-          if (!parsed?.id || parsed?.sidecar) continue;
-          const rawStr = JSON.stringify(parsed.projectResources || parsed.workspaces || {});
-          if (rawStr.includes(cleanTarget)) {
-            return String(parsed.id);
-          }
-        } catch {
-          // Ignore malformed project file
-        }
-      }
-    } catch {
-      // Ignore unreadable projects dir
-    }
-    return 'outside-of-project';
+  resolveDesktopProjectIdForWorkspace(workspacePath, desktopProjectId = null) {
+    const directory = findWorkspaceDirectory(workspacePath);
+    if (!directory) return 'outside-of-project';
+    const matches = matchingDesktopProjects(this.desktopProjects.read(), directory.resolvedPath);
+    return (matches.find((project) => project.id === desktopProjectId) || matches[0])?.id || 'outside-of-project';
   }
 
   async createConversation({
@@ -329,6 +318,7 @@ export class AgentController {
     model = '',
     mode = 'agent',
     workspacePath = '',
+    desktopProjectId = null,
     createProjectName = '',
     attachments = [],
     metaStore = null,
@@ -337,13 +327,19 @@ export class AgentController {
     const rawCleanPrompt = String(prompt || '').trim();
     const cleanPrompt = rawCleanPrompt || (stagedPreview.length > 0 ? `请查看附件：${stagedPreview.map((a) => a.name).join('、')}` : '');
     if (!cleanPrompt) throw new Error('新建会话的首条消息不能为空');
+    let resolvedWorkspace = '';
+    if (!createProjectName && workspacePath != null && workspacePath !== '') {
+      resolvedWorkspace = resolveWorkspaceDirectory(workspacePath, { checkAccess: true }).resolvedPath;
+      const dir = await openWorkspaceDirectory(resolvedWorkspace);
+      await dir.close();
+    }
     if (!this.isAvailable()) {
       throw new Error(`未找到可执行的官方 agentapi: ${this.agentApiPath}`);
     }
 
-    let resolvedWorkspace = workspacePath ? String(workspacePath).trim() : '';
     if (createProjectName) {
-      resolvedWorkspace = await this.ensureProjectDirectory(createProjectName);
+      const path = await this.ensureProjectDirectory(createProjectName);
+      resolvedWorkspace = resolveWorkspaceDirectory(path, { checkAccess: true }).resolvedPath;
     }
 
     const beforeIds = this.#snapshotBrainIds();
@@ -378,8 +374,8 @@ export class AgentController {
     // and strip sidecar-origin metadata (`ANTIGRAVITY_SOURCE_METADATA`, etc.) so conversations
     // created from mobile are first-class user sessions that appear cleanly in Antigravity's
     // official Desktop & Web sidebars instead of being filtered out as sidecar-internal chats!
-    const targetProjectId = this.resolveDesktopProjectIdForWorkspace(resolvedWorkspace);
-    const cwd = resolvedWorkspace && existsSync(resolvedWorkspace) ? resolvedWorkspace : homedir();
+    const targetProjectId = this.resolveDesktopProjectIdForWorkspace(resolvedWorkspace, desktopProjectId);
+    const cwd = resolvedWorkspace || homedir();
     const env = {
       ...process.env,
       ANTIGRAVITY_PROJECT_ID: targetProjectId,
@@ -388,13 +384,20 @@ export class AgentController {
     delete env.ANTIGRAVITY_SIDECAR_UI_TOKEN;
     delete env.ANTIGRAVITY_SIDECAR_WEB_PORT;
     delete env.ANTIGRAVITY_EXECUTABLE_DATA_DIR;
-    const { stdout, stderr } = await this.execFn(this.agentApiPath, args, {
-      cwd,
-      env,
-      timeout: 15_000,
-      maxBuffer: 2 * 1024 * 1024,
-    });
+    let result;
+    try {
+      result = await this.execFn(this.agentApiPath, args, {
+        cwd,
+        env,
+        timeout: 15_000,
+        maxBuffer: 2 * 1024 * 1024,
+      });
+    } catch (error) {
+      if (resolvedWorkspace) resolveWorkspaceDirectory(resolvedWorkspace, { checkAccess: true });
+      throw error;
+    }
 
+    const { stdout, stderr } = result;
     const combined = `${stdout || ''}\n${stderr || ''}`;
     let conversationId = null;
 
@@ -436,6 +439,7 @@ export class AgentController {
         metaStore.recordMessageAttachments(conversationId, clientMessageId, finalAttachments);
       }
     }
+    if (resolvedWorkspace) metaStore?.rememberRecentWorkspace(resolvedWorkspace);
 
     return {
       ok: true,
