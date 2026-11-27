@@ -10,8 +10,7 @@ import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { AgentController } from '../src/agent-controller.mjs';
 import { ApnsPusher } from '../src/apns-pusher.mjs';
-import { BrainScanner } from '../src/brain-scanner.mjs';
-import { sanitizeAssistantLeakedTail } from '../src/brain-scanner.mjs';
+import { BrainScanner, sanitizeAssistantLeakedTail, uriToPath } from '../src/brain-scanner.mjs';
 import { BridgeServer } from '../src/bridge-server.mjs';
 import { BridgeUpdater, compareSemver } from '../src/bridge-updater.mjs';
 import { MetaStore } from '../src/meta-store.mjs';
@@ -3337,4 +3336,107 @@ test('Stop hook uses the sanitized summary for APNs and toast while retaining th
     const [item] = (await scanner.getConversationDetail(convId)).items;
     assert.equal(item.content, content);
   }
+});
+
+test('uriToPath parses JSON-array workspace_uris, URL-encoded spaces, empty arrays, and legacy comma-separated URIs', () => {
+  assert.equal(uriToPath('["file:///Volumes/TestDrive/LifeOS"]'), '/Volumes/TestDrive/LifeOS');
+  assert.equal(
+    uriToPath('["file:///Volumes/TestDrive/My%20Project/", "file:///tmp/second"]'),
+    '/Volumes/TestDrive/My Project'
+  );
+  assert.equal(uriToPath('["", "file:///tmp/Foo,%20Bar"]'), '/tmp/Foo, Bar');
+  assert.equal(uriToPath('[{"uri":"file:///tmp/ObjectRepo"}]'), '/tmp/ObjectRepo');
+  assert.equal(uriToPath('"file:///tmp/QuotedRepo"'), '/tmp/QuotedRepo');
+  assert.equal(uriToPath('[]'), '');
+  assert.equal(uriToPath('["", null]'), '');
+  assert.equal(uriToPath('file:///tmp/First,file:///tmp/Second'), '/tmp/First');
+  assert.equal(uriToPath('/tmp/Folder, With Comma'), '/tmp/Folder, With Comma');
+  assert.equal(uriToPath('/'), '/');
+  assert.equal(uriToPath('project://fake'), 'project://fake');
+});
+
+test('BrainScanner resolves JSON-array workspace_uris cleanly and falls through on empty [] arrays', async (t) => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'levity-json-uris-'));
+  t.after(() => rmSync(sandbox, { recursive: true, force: true }));
+  const appData = join(sandbox, 'antigravity');
+  const projectsCfgDir = join(sandbox, 'projects-config');
+  const lifeOsDir = join(sandbox, 'LifeOS');
+  const fallbackDir = join(sandbox, 'FallbackProj');
+  const spacedDir = join(sandbox, 'My Space App');
+  for (const dir of [appData, projectsCfgDir, lifeOsDir, fallbackDir, spacedDir]) {
+    mkdirSync(dir, { recursive: true });
+  }
+
+  const fallbackProjId = '11111111-2222-3333-4444-555555555555';
+  writeFileSync(
+    join(projectsCfgDir, `${fallbackProjId}.json`),
+    JSON.stringify({
+      id: fallbackProjId,
+      name: 'Fallback Desktop Name',
+      projectResources: { localFolders: [{ uri: pathToFileURL(fallbackDir).href }] },
+    })
+  );
+
+  const lifeConvId = 'aaaaaaaa-1111-4222-8333-444444444401';
+  const emptyWithProjectConvId = 'aaaaaaaa-1111-4222-8333-444444444402';
+  const emptyFreeConvId = 'aaaaaaaa-1111-4222-8333-444444444403';
+  const spacedConvId = 'aaaaaaaa-1111-4222-8333-444444444404';
+
+  const db = new DatabaseSync(join(appData, 'conversation_summaries.db'));
+  db.exec(`
+    CREATE TABLE conversation_summaries (
+      conversation_id text PRIMARY KEY,
+      title text NOT NULL DEFAULT '',
+      preview text NOT NULL DEFAULT '',
+      step_count integer NOT NULL DEFAULT 0,
+      last_modified_time datetime NOT NULL,
+      workspace_uris text NOT NULL,
+      project_id text NOT NULL DEFAULT '',
+      status text NOT NULL DEFAULT '',
+      parent_conversation_id text NOT NULL DEFAULT '',
+      nesting_depth integer NOT NULL DEFAULT 0,
+      not_fully_idle numeric NOT NULL DEFAULT 0,
+      killed numeric NOT NULL DEFAULT 0
+    );
+  `);
+  const ins = db.prepare(
+    `INSERT INTO conversation_summaries
+     (conversation_id, title, last_modified_time, workspace_uris, project_id, status, parent_conversation_id, nesting_depth, not_fully_idle, killed)
+     VALUES (?, ?, ?, ?, ?, 'CASCADE_RUN_STATUS_IDLE', '', 0, 0, 0)`
+  );
+  ins.run(lifeConvId, 'LifeOS Session', '2026-11-27T05:00:00Z', JSON.stringify([pathToFileURL(lifeOsDir).href]), '');
+  ins.run(emptyWithProjectConvId, 'Empty Array Project Session', '2026-11-27T05:01:00Z', '[]', fallbackProjId);
+  ins.run(emptyFreeConvId, 'Empty Array Free Session', '2026-11-27T05:02:00Z', '[]', 'outside-of-project');
+  ins.run(spacedConvId, 'Spaced Repo Session', '2026-11-27T05:03:00Z', JSON.stringify([pathToFileURL(spacedDir).href]), '');
+  db.close();
+
+  for (const cid of [lifeConvId, emptyWithProjectConvId, emptyFreeConvId, spacedConvId]) {
+    const logDir = join(appData, 'brain', cid, '.system_generated', 'logs');
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(
+      join(logDir, 'transcript_full.jsonl'),
+      JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-27T05:00:00Z', content: 'hello' }) + '\n'
+    );
+  }
+
+  const scanner = new BrainScanner({
+    appDataDirs: [appData],
+    projectsRoot: join(sandbox, 'Projects'),
+    projectsConfigDir: projectsCfgDir,
+  });
+  const scan = await scanner.scanAll({ includeMetadata: false });
+  const convById = new Map(scan.workspaces.flatMap((w) => w.conversations).map((c) => [c.id, c]));
+
+  assert.equal(convById.get(lifeConvId).workspacePath, lifeOsDir);
+  assert.equal(convById.get(lifeConvId).workspaceName, 'LifeOS');
+  assert.equal(convById.get(spacedConvId).workspacePath, spacedDir);
+  assert.equal(convById.get(spacedConvId).workspaceName, 'My Space App');
+  assert.equal(convById.get(emptyWithProjectConvId).workspacePath, realpathSync(fallbackDir));
+  assert.equal(convById.get(emptyWithProjectConvId).workspaceName, 'Fallback Desktop Name');
+  assert.equal(convById.get(emptyFreeConvId).workspacePath, null);
+  assert.equal(convById.get(emptyFreeConvId).workspaceName, '通用对话');
+  assert.ok(
+    scan.knownProjects.some((p) => realpathSync(p.path) === realpathSync(lifeOsDir) && p.name === 'LifeOS'),
+    'JSON-array historical workspace must also appear cleanly in knownProjects'
+  );
 });

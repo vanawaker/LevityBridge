@@ -434,18 +434,61 @@ function humanizeToolActivity(name, args) {
   }
 }
 
-function uriToPath(uriOrPath) {
-  if (!uriOrPath || typeof uriOrPath !== 'string') return '';
-  const first = uriOrPath.split(',')[0].trim();
-  if (!first) return '';
-  if (first.startsWith('file://')) {
+export function uriToPath(uriOrPath, { allowCommaSplit = true, depth = 0 } = {}) {
+  if (!uriOrPath || depth > 4) return '';
+  if (Array.isArray(uriOrPath)) {
+    for (const item of uriOrPath) {
+      const resolved = uriToPath(item, { allowCommaSplit: false, depth: depth + 1 });
+      if (resolved) return resolved;
+    }
+    return '';
+  }
+  if (typeof uriOrPath === 'object') {
+    const candidate =
+      uriOrPath.workspaceFolderAbsoluteUri ||
+      uriOrPath.folderUri ||
+      uriOrPath.workspaceUri ||
+      uriOrPath.uri ||
+      uriOrPath.folderPath ||
+      uriOrPath.path ||
+      '';
+    return uriToPath(candidate, { allowCommaSplit: false, depth: depth + 1 });
+  }
+  if (typeof uriOrPath !== 'string') return '';
+  const trimmed = uriOrPath.trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('[') || trimmed.startsWith('"') || trimmed.startsWith('{')) {
     try {
-      return fileURLToPath(first);
+      const parsed = JSON.parse(trimmed);
+      if (parsed !== trimmed) {
+        return uriToPath(parsed, { allowCommaSplit: false, depth: depth + 1 });
+      }
     } catch {
-      return first.replace(/^file:\/\//, '');
+      // Not valid JSON; continue with plain URI/path handling.
     }
   }
-  return first;
+  const first =
+    allowCommaSplit && /,\s*file:\/\//i.test(trimmed)
+      ? trimmed.split(/,\s*(?=file:\/\/)/i)[0].trim()
+      : trimmed;
+  if (!first) return '';
+  let resolved = first;
+  if (first.startsWith('file://')) {
+    try {
+      resolved = fileURLToPath(first);
+    } catch {
+      const stripped = first.replace(/^file:\/\//, '');
+      try {
+        resolved = decodeURIComponent(stripped);
+      } catch {
+        resolved = stripped;
+      }
+    }
+  }
+  if (resolved.length > 1 && resolved.endsWith('/')) {
+    resolved = resolved.replace(/\/+$/, '') || '/';
+  }
+  return resolved;
 }
 
 function parsePbtxtTitle(txt) {
@@ -1723,23 +1766,31 @@ export class BrainScanner {
 
     if (dbEntry?.workspaceUri) {
       workspacePath = uriToPath(dbEntry.workspaceUri);
-      workspaceName = workspacePath ? basename(workspacePath) : '';
-    } else if (meta?.workspaceUris?.length) {
-      workspacePath = uriToPath(meta.workspaceUris[0]);
-      workspaceName = workspacePath ? basename(workspacePath) : '';
-    } else if (meta?.workspaces?.length) {
-      const ws0 = meta.workspaces[0];
-      workspacePath = uriToPath(typeof ws0 === 'string' ? ws0 : ws0?.workspaceFolderAbsoluteUri || ws0?.uri || '');
-      workspaceName = workspacePath ? basename(workspacePath) : '';
-    } else if (realProject) {
+    }
+    if (!workspacePath && meta?.workspaceUris?.length) {
+      workspacePath = uriToPath(meta.workspaceUris);
+    }
+    if (!workspacePath && meta?.workspaces?.length) {
+      workspacePath = uriToPath(meta.workspaces);
+    }
+    if (!workspacePath && realProject) {
       workspacePath = realProject.folderPath || `project://${realProject.id}`;
       workspaceName = realProject.name || (realProject.folderPath ? basename(realProject.folderPath) : '项目');
-    } else if (hook?.workspacePaths?.length) {
-      workspacePath = uriToPath(hook.workspacePaths[0]);
-      workspaceName = workspacePath ? basename(workspacePath) : '';
-    } else if (savedMeta?.workspacePath) {
-      workspacePath = savedMeta.workspacePath;
-      workspaceName = workspacePath ? basename(workspacePath) : '';
+    }
+    if (!workspacePath && hook?.workspacePaths?.length) {
+      workspacePath = uriToPath(hook.workspacePaths);
+    }
+    if (!workspacePath && savedMeta?.workspacePath) {
+      workspacePath = uriToPath(savedMeta.workspacePath);
+    }
+
+    if (workspacePath && !workspaceName) {
+      const matchesRealProject =
+        realProject &&
+        realProject.name &&
+        ((realProject.folderPath && workspacePath === realProject.folderPath) ||
+          (Array.isArray(realProject.folderPaths) && realProject.folderPaths.includes(workspacePath)));
+      workspaceName = matchesRealProject ? realProject.name : basename(workspacePath);
     }
 
     return {
