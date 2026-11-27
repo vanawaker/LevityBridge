@@ -362,24 +362,40 @@ function extractBalancedJsonObject(str, fromIndex = 0) {
   return null;
 }
 
-function parseAskQuestionArgs(args) {
+export function parseAskQuestionArgs(args) {
   if (!args) return null;
-  let questions = args.questions;
-  if (typeof questions === 'string') {
+  let rawQuestions = args.questions;
+  if (typeof rawQuestions === 'string') {
     try {
-      questions = JSON.parse(questions);
+      rawQuestions = JSON.parse(rawQuestions);
     } catch {
       return null;
     }
   }
-  if (!Array.isArray(questions) || questions.length === 0) return null;
-  const q0 = questions[0];
-  if (!q0 || typeof q0.question !== 'string') return null;
-  const opts = Array.isArray(q0.options) ? q0.options.map((o) => String(o)) : [];
+  if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) return null;
+  const normalized = [];
+  for (let i = 0; i < rawQuestions.length; i++) {
+    const item = rawQuestions[i];
+    if (!item || typeof item.question !== 'string') continue;
+    const text = item.question.trim();
+    if (!text) continue;
+    const opts = Array.isArray(item.options)
+      ? item.options.map((o) => String(o ?? '').trim()).filter(Boolean)
+      : [];
+    normalized.push({
+      id: `q-${i}`,
+      question: text,
+      options: opts,
+      multiSelect: Boolean(item.is_multi_select ?? item.multiSelect),
+    });
+  }
+  if (normalized.length === 0) return null;
+  const q0 = normalized[0];
   return {
-    question: q0.question.trim(),
-    options: opts,
-    multiSelect: Boolean(q0.is_multi_select),
+    question: q0.question,
+    options: q0.options,
+    multiSelect: q0.multiSelect,
+    questions: normalized,
   };
 }
 
@@ -434,25 +450,42 @@ function humanizeToolActivity(name, args) {
   }
 }
 
-export function uriToPath(uriOrPath, { allowCommaSplit = true, depth = 0 } = {}) {
+const MAX_PENDING_TASK_AGE_MS = 20 * 60 * 1000;
+
+function isPlausibleWorkspacePathOrUri(value) {
+  if (!value || typeof value !== 'string') return false;
+  return (
+    value.startsWith('/') ||
+    value.startsWith('~/') ||
+    /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ||
+    /^[a-z]:[\\/]/i.test(value)
+  );
+}
+
+export function uriToPath(uriOrPath, { allowCommaSplit = true, depth = 0, requireValidCandidate = false } = {}) {
   if (!uriOrPath || depth > 4) return '';
   if (Array.isArray(uriOrPath)) {
     for (const item of uriOrPath) {
-      const resolved = uriToPath(item, { allowCommaSplit: false, depth: depth + 1 });
+      const resolved = uriToPath(item, { allowCommaSplit: false, depth: depth + 1, requireValidCandidate: true });
       if (resolved) return resolved;
     }
     return '';
   }
   if (typeof uriOrPath === 'object') {
-    const candidate =
-      uriOrPath.workspaceFolderAbsoluteUri ||
-      uriOrPath.folderUri ||
-      uriOrPath.workspaceUri ||
-      uriOrPath.uri ||
-      uriOrPath.folderPath ||
-      uriOrPath.path ||
-      '';
-    return uriToPath(candidate, { allowCommaSplit: false, depth: depth + 1 });
+    for (const key of [
+      'workspaceFolderAbsoluteUri',
+      'folderUri',
+      'workspaceUri',
+      'uri',
+      'folderPath',
+      'path',
+    ]) {
+      const candidate = uriOrPath[key];
+      if (!candidate) continue;
+      const resolved = uriToPath(candidate, { allowCommaSplit: false, depth: depth + 1, requireValidCandidate: true });
+      if (resolved) return resolved;
+    }
+    return '';
   }
   if (typeof uriOrPath !== 'string') return '';
   const trimmed = uriOrPath.trim();
@@ -461,7 +494,7 @@ export function uriToPath(uriOrPath, { allowCommaSplit = true, depth = 0 } = {})
     try {
       const parsed = JSON.parse(trimmed);
       if (parsed !== trimmed) {
-        return uriToPath(parsed, { allowCommaSplit: false, depth: depth + 1 });
+        return uriToPath(parsed, { allowCommaSplit: false, depth: depth + 1, requireValidCandidate });
       }
     } catch {
       // Not valid JSON; continue with plain URI/path handling.
@@ -473,11 +506,12 @@ export function uriToPath(uriOrPath, { allowCommaSplit = true, depth = 0 } = {})
       : trimmed;
   if (!first) return '';
   let resolved = first;
-  if (first.startsWith('file://')) {
+  if (/^file:\/\//i.test(first)) {
+    const normalizedFileUri = `file://${first.slice(7)}`;
     try {
-      resolved = fileURLToPath(first);
+      resolved = fileURLToPath(normalizedFileUri);
     } catch {
-      const stripped = first.replace(/^file:\/\//, '');
+      const stripped = first.replace(/^file:\/\//i, '');
       try {
         resolved = decodeURIComponent(stripped);
       } catch {
@@ -487,6 +521,9 @@ export function uriToPath(uriOrPath, { allowCommaSplit = true, depth = 0 } = {})
   }
   if (resolved.length > 1 && resolved.endsWith('/')) {
     resolved = resolved.replace(/\/+$/, '') || '/';
+  }
+  if (requireValidCandidate && !isPlausibleWorkspacePathOrUri(resolved)) {
+    return '';
   }
   return resolved;
 }
@@ -901,6 +938,8 @@ export class BrainScanner {
       hasPendingBackgroundTasks: false,
       pendingTaskCount: 0,
       pendingSubagentCount: 0,
+      pendingTaskStartedTimes: [],
+      pendingSubagentStartedTimes: [],
       mtimeMs: 0,
     };
     const tPath = this.findTranscriptPath(convDir);
@@ -1125,6 +1164,7 @@ export class BrainScanner {
                 prompt: parsedQ.question,
                 options: parsedQ.options,
                 multiSelect: parsedQ.multiSelect,
+                questions: parsedQ.questions,
               };
             }
           }
@@ -1190,43 +1230,54 @@ export class BrainScanner {
         };
         items.push(assistantItem);
         pendingToolBatch = mappedTools.length > 0 ? { tools: mappedTools, meta: batchMeta, cursor: 0 } : null;
-      } else if (step.type === 'GENERIC' && pendingToolBatch) {
-        if (lastAssistantStepIndex >= 0) {
-          hasNonBookkeepingStepAfterLastAssistant = true;
+      } else if (step.type === 'GENERIC') {
+        const out = String(step.content || '').trim();
+        for (const re of [
+          /Wait cancelled\s*\(\s*task\s+([^\s),]+)/gi,
+          /Task\s+(?:id\s+)?"([^"]+)"\s+(?:finished|failed|cancelled|canceled|killed|stopped|exited)/gi,
+          /\bTask\s+([0-9a-zA-Z_-]+\/task-\d+)\s+(?:finished|failed|cancelled|canceled|killed|stopped|exited)/gi,
+        ]) {
+          for (const match of out.matchAll(re)) {
+            if (match[1]) turnPendingTasks.delete(match[1]);
+          }
         }
-        const targetTool = pendingToolBatch.tools[pendingToolBatch.cursor];
-        const targetMeta = pendingToolBatch.meta?.[pendingToolBatch.cursor] || { isDaemon: false };
-        if (targetTool) {
-          const out = String(step.content || '').trim();
-          targetTool.outputPreview = out.slice(0, 600);
-          targetTool.status = step.status === 'ERROR' ? 'error' : 'done';
-          if (targetTool.name === 'ask_question' && step.status === 'DONE') {
-            unansweredQuestion = null;
+        if (pendingToolBatch) {
+          if (lastAssistantStepIndex >= 0) {
+            hasNonBookkeepingStepAfterLastAssistant = true;
           }
-          const convMatch = /conversationId["\s:=]+([0-9a-f-]{36})/i.exec(out);
-          if (convMatch && targetTool.name === 'invoke_subagent') {
-            targetTool.subagentConversationId = convMatch[1];
-            const startedMs = createdAt ? Date.parse(createdAt) || st.mtimeMs : st.mtimeMs;
-            turnPendingSubagents.set(convMatch[1], startedMs);
-          }
-          const isAsyncBgTool =
-            targetTool.name === 'run_command' ||
-            targetTool.name === 'run_workflow' ||
-            targetTool.name === 'schedule';
-          if (!targetMeta.isDaemon && isAsyncBgTool) {
-            const bgTaskMatch = /^Tool is running as a background task with task id:\s*([^\s\n]+)/im.exec(out);
-            if (bgTaskMatch) {
-              const startedMs = createdAt ? Date.parse(createdAt) || st.mtimeMs : st.mtimeMs;
-              turnPendingTasks.set(bgTaskMatch[1], startedMs);
-            } else if (
-              step.status === 'RUNNING' &&
-              (targetTool.name === 'run_command' || targetTool.name === 'run_workflow')
-            ) {
-              const startedMs = createdAt ? Date.parse(createdAt) || st.mtimeMs : st.mtimeMs;
-              turnPendingTasks.set(`step-${stepIdx}`, startedMs);
+          const targetTool = pendingToolBatch.tools[pendingToolBatch.cursor];
+          const targetMeta = pendingToolBatch.meta?.[pendingToolBatch.cursor] || { isDaemon: false };
+          if (targetTool) {
+            targetTool.outputPreview = out.slice(0, 600);
+            targetTool.status = step.status === 'ERROR' ? 'error' : 'done';
+            if (targetTool.name === 'ask_question' && step.status === 'DONE') {
+              unansweredQuestion = null;
             }
+            const convMatch = /conversationId["\s:=]+([0-9a-f-]{36})/i.exec(out);
+            if (convMatch && targetTool.name === 'invoke_subagent') {
+              targetTool.subagentConversationId = convMatch[1];
+              const startedMs = createdAt ? Date.parse(createdAt) || st.mtimeMs : st.mtimeMs;
+              turnPendingSubagents.set(convMatch[1], startedMs);
+            }
+            const isAsyncBgTool =
+              targetTool.name === 'run_command' ||
+              targetTool.name === 'run_workflow' ||
+              targetTool.name === 'schedule';
+            if (!targetMeta.isDaemon && isAsyncBgTool) {
+              const bgTaskMatch = /^Tool is running as a background task with task id:\s*([^\s\n]+)/im.exec(out);
+              if (bgTaskMatch) {
+                const startedMs = createdAt ? Date.parse(createdAt) || st.mtimeMs : st.mtimeMs;
+                turnPendingTasks.set(bgTaskMatch[1], startedMs);
+              } else if (
+                step.status === 'RUNNING' &&
+                (targetTool.name === 'run_command' || targetTool.name === 'run_workflow')
+              ) {
+                const startedMs = createdAt ? Date.parse(createdAt) || st.mtimeMs : st.mtimeMs;
+                turnPendingTasks.set(`step-${stepIdx}`, startedMs);
+              }
+            }
+            pendingToolBatch.cursor++;
           }
-          pendingToolBatch.cursor++;
         }
       } else if (step.type === 'ERROR_MESSAGE' || step.status === 'ERROR') {
         const errText = String(step.content || '执行过程中出现错误').trim();
@@ -1295,19 +1346,10 @@ export class BrainScanner {
     }
 
     const nowMs = Date.now();
-    const MAX_PENDING_TASK_AGE_MS = 20 * 60 * 1000;
-    let pendingTaskCount = 0;
-    for (const startedMs of turnPendingTasks.values()) {
-      if (!startedMs || nowMs - startedMs < MAX_PENDING_TASK_AGE_MS) {
-        pendingTaskCount++;
-      }
-    }
-    let pendingSubagentCount = 0;
-    for (const startedMs of turnPendingSubagents.values()) {
-      if (!startedMs || nowMs - startedMs < MAX_PENDING_TASK_AGE_MS) {
-        pendingSubagentCount++;
-      }
-    }
+    const pendingTaskStartedTimes = [...turnPendingTasks.values()].map((t) => (Number.isFinite(t) && t > 0 ? t : st.mtimeMs));
+    const pendingSubagentStartedTimes = [...turnPendingSubagents.values()].map((t) => (Number.isFinite(t) && t > 0 ? t : st.mtimeMs));
+    const pendingTaskCount = pendingTaskStartedTimes.filter((t) => nowMs - t < MAX_PENDING_TASK_AGE_MS).length;
+    const pendingSubagentCount = pendingSubagentStartedTimes.filter((t) => nowMs - t < MAX_PENDING_TASK_AGE_MS).length;
     const hasPendingBackgroundTasks = pendingTaskCount > 0 || pendingSubagentCount > 0;
 
     const MAX_TURN_GENERATION_MS = 20 * 60 * 1000;
@@ -1341,6 +1383,8 @@ export class BrainScanner {
       hasPendingBackgroundTasks,
       pendingTaskCount,
       pendingSubagentCount,
+      pendingTaskStartedTimes,
+      pendingSubagentStartedTimes,
       mtimeMs: st.mtimeMs,
     };
     this.transcriptCache.set(tPath, { key: cacheKey, parsed });
@@ -1430,6 +1474,7 @@ export class BrainScanner {
           prompt: q.question,
           options: q.options,
           multiSelect: q.multiSelect,
+          questions: q.questions,
         };
       }
     }
@@ -1563,6 +1608,7 @@ export class BrainScanner {
           prompt: inFlight.askQuestion.question,
           options: inFlight.askQuestion.options,
           multiSelect: inFlight.askQuestion.multiSelect,
+          questions: inFlight.askQuestion.questions,
         };
       }
       if (
@@ -1633,6 +1679,31 @@ export class BrainScanner {
     }
   }
 
+  evaluatePendingBackgroundTasks(parsedTranscript, dbEntry = null, nowMs = Date.now()) {
+    const taskTimes = Array.isArray(parsedTranscript?.pendingTaskStartedTimes)
+      ? parsedTranscript.pendingTaskStartedTimes
+      : [];
+    const subTimes = Array.isArray(parsedTranscript?.pendingSubagentStartedTimes)
+      ? parsedTranscript.pendingSubagentStartedTimes
+      : [];
+    const activeTaskTimes = taskTimes.filter((t) => Number.isFinite(t) && t > 0 && nowMs - t < MAX_PENDING_TASK_AGE_MS);
+    const activeSubTimes = subTimes.filter((t) => Number.isFinite(t) && t > 0 && nowMs - t < MAX_PENDING_TASK_AGE_MS);
+    if (activeTaskTimes.length === 0 && activeSubTimes.length === 0) {
+      return { hasPendingBackgroundTasks: false, pendingTaskCount: 0, pendingSubagentCount: 0 };
+    }
+    if (dbEntry && dbEntry.status === 'CASCADE_RUN_STATUS_IDLE' && !dbEntry.notFullyIdle) {
+      const latestPendingStart = Math.max(0, ...activeTaskTimes, ...activeSubTimes);
+      if (!dbEntry.modifiedMs || dbEntry.modifiedMs >= latestPendingStart - 1000) {
+        return { hasPendingBackgroundTasks: false, pendingTaskCount: 0, pendingSubagentCount: 0 };
+      }
+    }
+    return {
+      hasPendingBackgroundTasks: true,
+      pendingTaskCount: activeTaskTimes.length,
+      pendingSubagentCount: activeSubTimes.length,
+    };
+  }
+
   computeRunState(convId, parsedTranscript, dbEntry = null, pendingInteraction = null) {
     if (pendingInteraction?.kind === 'permission_waiting') {
       return {
@@ -1651,6 +1722,7 @@ export class BrainScanner {
 
     const hook = this.liveHooks.get(convId);
     const now = Date.now();
+    const pendingBg = this.evaluatePendingBackgroundTasks(parsedTranscript, dbEntry, now);
     const lastItem = parsedTranscript.items[parsedTranscript.items.length - 1];
     const lastItemMs = lastItem?.createdAt ? Date.parse(lastItem.createdAt) || 0 : 0;
 
@@ -1664,7 +1736,7 @@ export class BrainScanner {
       (
         (lastItem?.role === 'error' && (lastItemMs >= hook.updatedAt - 1000 || parsedTranscript.mtimeMs >= hook.updatedAt)) ||
         (lastItem?.role === 'assistant' && lastItem.isTurnFinal && Math.max(lastItemMs, parsedTranscript.lastAssistantReplyMs || 0) > hook.updatedAt + 500 && dbEntry?.status === 'CASCADE_RUN_STATUS_IDLE' && !dbEntry?.notFullyIdle) ||
-        (dbEntry?.status === 'CASCADE_RUN_STATUS_IDLE' && !dbEntry?.notFullyIdle && dbEntry?.modifiedMs > hook.updatedAt + 800 && !parsedTranscript.hasPendingBackgroundTasks)
+        (dbEntry?.status === 'CASCADE_RUN_STATUS_IDLE' && !dbEntry?.notFullyIdle && dbEntry?.modifiedMs > hook.updatedAt + 800 && !pendingBg.hasPendingBackgroundTasks)
       )
     );
     if (hookInvalidatedByTerminalTranscript) {
@@ -1688,9 +1760,9 @@ export class BrainScanner {
         detail: effectiveHook.detail || '思考中…',
       };
     }
-    if (parsedTranscript.hasPendingBackgroundTasks) {
+    if (pendingBg.hasPendingBackgroundTasks) {
       const detailMsg =
-        parsedTranscript.pendingSubagentCount > 0 && parsedTranscript.pendingTaskCount === 0
+        pendingBg.pendingSubagentCount > 0 && pendingBg.pendingTaskCount === 0
           ? '等待子代理完成…'
           : '等待后台任务完成…';
       return {
@@ -1785,11 +1857,21 @@ export class BrainScanner {
     }
 
     if (workspacePath && !workspaceName) {
+      const canonical = (p) => {
+        if (!p) return '';
+        try {
+          return realpathSync(p);
+        } catch {
+          return p;
+        }
+      };
+      const canonicalWorkspace = canonical(workspacePath);
       const matchesRealProject =
         realProject &&
         realProject.name &&
-        ((realProject.folderPath && workspacePath === realProject.folderPath) ||
-          (Array.isArray(realProject.folderPaths) && realProject.folderPaths.includes(workspacePath)));
+        ((realProject.folderPath && (workspacePath === realProject.folderPath || canonicalWorkspace === canonical(realProject.folderPath))) ||
+          (Array.isArray(realProject.folderPaths) &&
+            realProject.folderPaths.some((fp) => workspacePath === fp || canonicalWorkspace === canonical(fp))));
       workspaceName = matchesRealProject ? realProject.name : basename(workspacePath);
     }
 
@@ -2223,6 +2305,7 @@ export class BrainScanner {
         parentConversationId || (dbEntry?.nestingDepth || 0) > 0 || isSubagentInMap
       );
 
+      const pendingBg = this.evaluatePendingBackgroundTasks(parsed, dbEntry);
       return {
         id: convId,
         title,
@@ -2235,7 +2318,7 @@ export class BrainScanner {
         workspaceName,
         runState: runStatus.state,
         activityDetail: runStatus.detail,
-        hasPendingBackgroundTasks: Boolean(parsed.hasPendingBackgroundTasks),
+        hasPendingBackgroundTasks: pendingBg.hasPendingBackgroundTasks,
         notFullyIdle: Boolean(dbEntry?.notFullyIdle),
         detectedModelId: modelAndMode.detectedModelId,
         currentModelId: modelAndMode.currentModelId,

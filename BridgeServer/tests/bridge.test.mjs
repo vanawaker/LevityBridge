@@ -10,7 +10,7 @@ import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { AgentController } from '../src/agent-controller.mjs';
 import { ApnsPusher } from '../src/apns-pusher.mjs';
-import { BrainScanner, sanitizeAssistantLeakedTail, uriToPath } from '../src/brain-scanner.mjs';
+import { BrainScanner, parseAskQuestionArgs, sanitizeAssistantLeakedTail, uriToPath } from '../src/brain-scanner.mjs';
 import { BridgeServer } from '../src/bridge-server.mjs';
 import { BridgeUpdater, compareSemver } from '../src/bridge-updater.mjs';
 import { MetaStore } from '../src/meta-store.mjs';
@@ -3439,4 +3439,111 @@ test('BrainScanner resolves JSON-array workspace_uris cleanly and falls through 
     scan.knownProjects.some((p) => realpathSync(p.path) === realpathSync(lifeOsDir) && p.name === 'LifeOS'),
     'JSON-array historical workspace must also appear cleanly in knownProjects'
   );
+});
+
+test('uriToPath handles uppercase FILE:// schemes and skips invalid non-path array items', () => {
+  assert.equal(uriToPath('["not a path", "FILE:///tmp/Good%20Repo"]'), '/tmp/Good Repo');
+  assert.equal(uriToPath('[{"uri": "junk", "folderPath": "/tmp/FallbackObj"}]'), '/tmp/FallbackObj');
+  assert.equal(uriToPath('["not a path"]'), '');
+});
+
+test('parseAskQuestionArgs preserves full multi-question list alongside backwards-compatible first-question fields', () => {
+  const parsed = parseAskQuestionArgs({
+    questions: [
+      { question: 'Choose presentation?', options: ['(Recommended) Sheet', 'Inline'], is_multi_select: false },
+      { question: 'Pick platforms?', options: ['iPhone', 'iPad', 'Mac'], is_multi_select: true },
+    ],
+  });
+  assert.equal(parsed.question, 'Choose presentation?');
+  assert.deepEqual(parsed.options, ['(Recommended) Sheet', 'Inline']);
+  assert.equal(parsed.multiSelect, false);
+  assert.equal(parsed.questions.length, 2);
+  assert.equal(parsed.questions[1].question, 'Pick platforms?');
+  assert.equal(parsed.questions[1].multiSelect, true);
+  assert.deepEqual(parsed.questions[1].options, ['iPhone', 'iPad', 'Mac']);
+});
+
+test('BrainScanner clears stuck background tasks on Wait cancelled, SQLite fully-idle, and cache age expiry', async (t) => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'levity-bg-clear-'));
+  t.after(() => rmSync(sandbox, { recursive: true, force: true }));
+  const appData = join(sandbox, 'antigravity');
+  mkdirSync(appData, { recursive: true });
+  const cancelledConvId = 'bbbbbbbb-1111-4222-8333-444444444401';
+  const idleSqlConvId = 'bbbbbbbb-1111-4222-8333-444444444402';
+  const expiredConvId = 'bbbbbbbb-1111-4222-8333-444444444403';
+
+  const nowMs = Date.now();
+  const recentIso = new Date(nowMs - 10_000).toISOString();
+  const db = new DatabaseSync(join(appData, 'conversation_summaries.db'));
+  db.exec(`
+    CREATE TABLE conversation_summaries (
+      conversation_id text PRIMARY KEY,
+      title text NOT NULL DEFAULT '',
+      preview text NOT NULL DEFAULT '',
+      step_count integer NOT NULL DEFAULT 0,
+      last_modified_time datetime NOT NULL,
+      workspace_uris text NOT NULL,
+      project_id text NOT NULL DEFAULT '',
+      status text NOT NULL DEFAULT '',
+      parent_conversation_id text NOT NULL DEFAULT '',
+      nesting_depth integer NOT NULL DEFAULT 0,
+      not_fully_idle numeric NOT NULL DEFAULT 0,
+      killed numeric NOT NULL DEFAULT 0
+    );
+  `);
+  const ins = db.prepare(
+    `INSERT INTO conversation_summaries
+     (conversation_id, title, last_modified_time, workspace_uris, project_id, status, parent_conversation_id, nesting_depth, not_fully_idle, killed)
+     VALUES (?, ?, ?, '', 'outside-of-project', ?, '', 0, ?, 0)`
+  );
+  ins.run(cancelledConvId, 'Cancelled Timer', new Date(nowMs - 2_000).toISOString(), 'CASCADE_RUN_STATUS_IDLE', 0);
+  ins.run(idleSqlConvId, 'SQLite Fully Idle', new Date(nowMs - 2_000).toISOString(), 'CASCADE_RUN_STATUS_IDLE', 0);
+  db.close();
+
+  const writeTranscript = (cid, steps) => {
+    const logDir = join(appData, 'brain', cid, '.system_generated', 'logs');
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(join(logDir, 'transcript_full.jsonl'), steps.map((s) => JSON.stringify(s)).join('\n') + '\n');
+  };
+
+  // 1. Timer launched as background task, later cancelled via GENERIC "Wait cancelled (task ...)"
+  writeTranscript(cancelledConvId, [
+    { step_index: 1, type: 'USER_INPUT', created_at: recentIso, content: '测试定时取消' },
+    { step_index: 2, type: 'PLANNER_RESPONSE', created_at: recentIso, tool_calls: [{ id: 'tc1', name: 'schedule', args: { DurationSeconds: 90 } }], content: '' },
+    { step_index: 3, type: 'GENERIC', status: 'RUNNING', created_at: recentIso, content: `Tool is running as a background task with task id: ${cancelledConvId}/task-3` },
+    { step_index: 4, type: 'GENERIC', status: 'DONE', created_at: recentIso, content: `Wait cancelled (task ${cancelledConvId}/task-3 completed early)` },
+    { step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: recentIso, tool_calls: [], content: '测试已完成' },
+  ]);
+
+  // 2. Orphaned background task with no cancel line, but SQLite authoritatively says CASCADE_RUN_STATUS_IDLE + not_fully_idle=0
+  writeTranscript(idleSqlConvId, [
+    { step_index: 1, type: 'USER_INPUT', created_at: recentIso, content: '跑个任务' },
+    { step_index: 2, type: 'PLANNER_RESPONSE', created_at: recentIso, tool_calls: [{ id: 'tc1', name: 'run_command', args: { CommandLine: 'render' } }], content: '' },
+    { step_index: 3, type: 'GENERIC', status: 'RUNNING', created_at: recentIso, content: `Tool is running as a background task with task id: ${idleSqlConvId}/task-9` },
+    { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: recentIso, tool_calls: [], content: '已经做完了' },
+  ]);
+
+  // 3. No SQLite row, cached transcript expires dynamically when time advances past 20 min
+  writeTranscript(expiredConvId, [
+    { step_index: 1, type: 'USER_INPUT', created_at: recentIso, content: '长时间任务' },
+    { step_index: 2, type: 'PLANNER_RESPONSE', created_at: recentIso, tool_calls: [{ id: 'tc1', name: 'run_command', args: { CommandLine: 'long-job' } }], content: '' },
+    { step_index: 3, type: 'GENERIC', status: 'RUNNING', created_at: recentIso, content: `Tool is running as a background task with task id: ${expiredConvId}/task-77` },
+  ]);
+
+  const scanner = new BrainScanner({ appDataDirs: [appData] });
+  const detCancelled = await scanner.getConversationDetail(cancelledConvId);
+  assert.equal(detCancelled.hasPendingBackgroundTasks, false);
+  assert.equal(detCancelled.runState, 'idle');
+
+  const detIdleSql = await scanner.getConversationDetail(idleSqlConvId);
+  assert.equal(detIdleSql.hasPendingBackgroundTasks, false);
+  assert.equal(detIdleSql.runState, 'idle');
+
+  const detActive = await scanner.getConversationDetail(expiredConvId);
+  assert.equal(detActive.hasPendingBackgroundTasks, true);
+  assert.equal(detActive.runState, 'running');
+
+  const parsedCached = scanner.parseTranscript(join(appData, 'brain', expiredConvId));
+  const futureEval = scanner.evaluatePendingBackgroundTasks(parsedCached, null, nowMs + 25 * 60 * 1000);
+  assert.equal(futureEval.hasPendingBackgroundTasks, false, 'Cached pending tasks must expire dynamically with wall clock');
 });

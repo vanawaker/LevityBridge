@@ -1,7 +1,7 @@
 {
   "name": "levity-bridge",
   "displayName": "LevityBridge",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Open-source companion bridge plugin syncing Antigravity desktop sessions with Levity on iPhone, iPad, and iPhone Duo over LAN or Tailscale.",
   "homepage": "https://spaceshuttle.xyz/levity/",
   "repository": "https://github.com/vanawaker/LevityBridge",
